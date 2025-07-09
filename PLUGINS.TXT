@@ -1,0 +1,3 @@
+vsh, ms0:/SEPLUGINS/KillSwitchHold.prx, on
+
+game, ms0:/SEPLUGINS/KillSwitch.prx, on
