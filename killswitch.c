@@ -3,31 +3,35 @@
 //
 // Ryan Crosby 2025
 
-#include <stdbool.h>
-
+#ifdef DEBUG
 #include <pspdebug.h>
 #include <pspdisplay.h>
+#endif
 
 #include <pspsdk.h>
-#include <pspkernel.h>
 #include <psppower.h>
 #include <pspsysevent.h>
 #include <pspctrl.h>
-#include <psptypes.h>
+#include <pspkerror.h>
+
+#include <stdbool.h>
 
 #define ONE_MSEC 1000
 #define ONE_SEC (1000 * ONE_MSEC)
 
 #ifdef DEBUG
-#define DEBUG_PRINT(...) fprintf( stderr, __VA_ARGS__ )
+#define DEBUG_PRINT(...) pspDebugScreenKprintf( __VA_ARGS__ )
 #else
 #define DEBUG_PRINT(...) do{ } while ( 0 )
 #endif
+
+//#define DEBUG_PRINT(...) pspDebugScreenPrintf( __VA_ARGS__ )
 
 // Allow the switch to work when this button combo is pressed
 // Hold HOME + Power Switch to sleep.
 // See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
 #define BUTTON_COMBO_MASK PSP_CTRL_HOME
+#define MAX_CONSECUTIVE_SLEEPS 10
 
 #define MODULE_NAME "KillSwitch"
 #define MAJOR_VER 1
@@ -53,7 +57,8 @@ PSP_NO_CREATE_MAIN_THREAD();
 
 static int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result);
 
-bool power_switch_pressed = false;
+bool allow_sleep = true;
+int consecutive_sleep_blocks = 0;
 int callback_thid = -1;
 
 // Our PspSysEventHandler to receive the power switch event
@@ -80,33 +85,26 @@ PspSysEventHandler sys_event = {
 
 int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result)
 {
-    SceCtrlData pad_state;
-
-    DEBUG_PRINT("Got SysEvent %#010x - %s\n", ev_id, ev_name);
+    //DEBUG_PRINT("Got SysEvent %#010x - %s\n", ev_id, ev_name);
 
     // Trap SCE_SYSTEM_SUSPEND_EVENT_QUERY
     // Basically the ScePowerMain thread is asking us "is it okay to sleep?"
-    //
-    // If the physical power switch isn't currently pressed, this is a suspend or standby command
-    // coming from elsewhere (eg a PSP Cradle, or debugger poweroff command).
-    //
-    // We need to always allow suspend or standby from these other places, because if we don't,
-    // the event handler is called with SCE_SYSTEM_SUSPEND_EVENT_QUERY in a loop forever
-    // until we eventually return SCE_ERROR_OK (or we spin until the system watchdog takes down the whole system).
-    //
-    if(power_switch_pressed && ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY) {
-        // Peek (not read) the buffer so that we don't cause other callers using Read to block
-        if(sceCtrlPeekBufferPositive(&pad_state, 1) >= 0) {
-            // Check if the user is holding down the combo
-            if((pad_state.Buttons & BUTTON_COMBO_MASK) == BUTTON_COMBO_MASK) {
-                // Allow sleep
-                power_switch_pressed = false;
-                return SCE_ERROR_OK;
-            }
-            else {
-                // User is not holding combo, so disallow sleep.
-                return SCE_ERROR_BUSY;
-            }
+    if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY && !allow_sleep) {
+        // There are edgecases where we can still get stuck in an infinite sleep request loop,
+        // eg if the user triggers a standby while holding the power switch up.
+        // Limit the maximum number of attempts that can be made during a single sleep disallow duration before
+        // the request is allowed through as a failsafe.
+        if(consecutive_sleep_blocks < MAX_CONSECUTIVE_SLEEPS) {
+            consecutive_sleep_blocks++;
+            DEBUG_PRINT("Blocked sleep query %#010x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
+            return SCE_ERROR_BUSY;
+        }
+        else {
+            DEBUG_PRINT("Max consecutive sleep queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
+
+            // We won't receive the power switch released callback since we'll be asleep, so reset allow_sleep here.
+            allow_sleep = true;
+            return SCE_ERROR_OK;
         }
     }
 
@@ -127,16 +125,50 @@ int unregister_suspend_handler(void)
 int power_callback_handler(int unknown, int pwrflags, void *common)
 {
     if (pwrflags & PSP_POWER_CB_POWER_SWITCH) {
-        // This is called immediately as the switch is pressed, before the SysEventHandler is called,
-        // so we have a chance to get in before it and set power_switch_pressed.
+        // This is called immediately as the switch is pressed.
+        // The SysEventHandler is called when the power switch is released, or held down for a second.
+        // This gives us a chance to get in before it and decide whether to allow the sleep.
 
-	    DEBUG_PRINT("Power switch pressed, disabling sleep\n");
-        power_switch_pressed = true;
+	    DEBUG_PRINT("Power switch pressed\n");
+
+        // Check if the user is pressing the override key combintion
+        //
+        SceCtrlData pad_state;
+        if(sceCtrlPeekBufferPositive(&pad_state, 1) >= 0) {
+            if((pad_state.Buttons & BUTTON_COMBO_MASK) == BUTTON_COMBO_MASK) {
+	            DEBUG_PRINT("Override key pressed, allowing sleep\n");
+                allow_sleep = true;
+            }
+            else {
+	            DEBUG_PRINT("Disallowing sleep\n");
+                allow_sleep = false;
+            }
+        }
+        else {
+            // There was an error reading button state. Allow sleep in this case.
+	        DEBUG_PRINT("Failed to read button state! Allowing sleep\n");
+            allow_sleep = true;
+        }
     }
     else {
-        // This is called as the switch is released, but after before the SysEventHandler is called,
-        // so it won't reset power_switch_pressed too early.
-        power_switch_pressed = false;
+        // If the physical power switch isn't currently pressed, this means any suspend or standby command
+        // will be coming from an event that wasn't the user hitting the power switch
+        // (eg a PSP HP Remote or Cradle command, or PSPLINK poweroff command).
+        //
+        // We need to always allow suspend or standby from these other places, because if we don't,
+        // sleep is re-attempted and SCE_SYSTEM_SUSPEND_EVENT_QUERY is raised in a loop
+        // until we eventually return SCE_ERROR_OK, or we spin until the system watchdog takes us down.
+        // Specifically, it appears that anything that calls scePowerRequestStandby() will re-fire the event forever.
+        //
+        if(!allow_sleep) {
+            DEBUG_PRINT("Allowing sleep\n");
+        }
+
+        allow_sleep = true;
+    }
+
+    if(allow_sleep) {
+        consecutive_sleep_blocks = 0;
     }
 
 	return 0;
@@ -160,7 +192,7 @@ int callback_thread(SceSize args, void *argp)
         sceKernelSleepThreadCB();
 
         // Cleanup
-        scePowerUnregisterCallback(slot);
+        scePowerUnregisterCallback(0);
     }
     else {
         DEBUG_PRINT("Failed to registered power callback: ret %i\n", slot);
@@ -169,34 +201,38 @@ int callback_thread(SceSize args, void *argp)
     // Cleanup
     sceKernelDeleteCallback(cbid);
 
-    if(slot < 0) {
-        return slot;
-    }
-
 	return 0;
 }
 
 // Starts callback thread
 int start_callbacks(void)
 {
-    int thid = 0;
-    thid = sceKernelCreateThread(MODULE_NAME "TaskCallbacks", callback_thread, 0x11, 0xFA0, 0, 0);
-    if (thid >= 0) {
-        callback_thid = thid;
-	    sceKernelStartThread(thid, 0, 0);
+    // name, entry, initPriority, stackSize, PspThreadAttributes, SceKernelThreadOptParam
+    //thid = sceKernelCreateThread(MODULE_NAME "TaskCallbacks", callback_thread, 0x11, 0xFA0, 0, 0);
+    callback_thid = sceKernelCreateThread(MODULE_NAME "TaskCallbacks", callback_thread, 0x11, 0x800, 0, 0);
+    if (callback_thid >= 0) {
+	    sceKernelStartThread(callback_thid, 0, 0);
     }
-    return thid;
+
+    return callback_thid;
 }
 
 int stop_callbacks(void)
 {
-    // Unblock sceKernelSleepThreadCB()
-    sceKernelWakeupThread(callback_thid);
-    // Wait for the callback thread to exit
-    sceKernelWaitThreadEnd(callback_thid, NULL);
-    // Cleanup
-    sceKernelDeleteThread(callback_thid);
-    callback_thid = -1;
+    int result;
+    if(callback_thid >= 0) {
+        // Unblock sceKernelSleepThreadCB()
+        sceKernelWakeupThread(callback_thid);
+        // Wait for the callback thread to clean up and exit
+        sceKernelWaitThreadEnd(callback_thid, NULL);
+        // Delete thread
+        result = sceKernelDeleteThread(callback_thid);
+        callback_thid = -1;
+
+        return result;
+    }
+
+    return 0;
 }
 
 // Called during module init
