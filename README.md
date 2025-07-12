@@ -66,10 +66,24 @@ For example, with ARK-4 CFW, add the following line to `SEPLUGINS/PLUGINS.TXT`:
 ## Building
 
 * Follow the PSPDEV toolchain [installation steps](https://pspdev.github.io/installation.html)
-* mkdir build
-* cd build
-* psp-cmake ..
-* make
+
+### For release
+
+```bash
+mkdir -p -- build/release
+cd build/release
+psp-cmake -DCMAKE_BUILD_TYPE=Release ../..
+make
+```
+
+### For debug (with debug logs to the PSP display)
+
+```bash
+mkdir -p -- build/debug
+cd build/debug
+psp-cmake -DCMAKE_BUILD_TYPE=Debug ../..
+make
+```
 
 ## Disclaimer
 
