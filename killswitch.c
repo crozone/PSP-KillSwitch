@@ -16,14 +16,14 @@
 
 #include <stdbool.h>
 
-#define ONE_MSEC 1000
-#define ONE_SEC (1000 * ONE_MSEC)
-
 #ifdef DEBUG
 #define DEBUG_PRINT(...) pspDebugScreenKprintf( __VA_ARGS__ )
 #else
 #define DEBUG_PRINT(...) do{ } while ( 0 )
 #endif
+
+#define ONE_MSEC 1000
+#define ONE_SEC (1000 * ONE_MSEC)
 
 // Allow the switch to work when this button combo is pressed
 // Hold HOME + Power Switch to sleep.
@@ -138,7 +138,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 
 	    DEBUG_PRINT("Power switch pressed\n");
 
-        // Check if the user is pressing the override key combintion
+        // Check if the user is pressing the override key combination
         //
         SceCtrlData pad_state;
         if(sceCtrlPeekBufferPositive(&pad_state, 1) >= 0) {
