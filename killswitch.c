@@ -25,8 +25,6 @@
 #define DEBUG_PRINT(...) do{ } while ( 0 )
 #endif
 
-//#define DEBUG_PRINT(...) pspDebugScreenPrintf( __VA_ARGS__ )
-
 // Allow the switch to work when this button combo is pressed
 // Hold HOME + Power Switch to sleep.
 // See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
@@ -44,6 +42,8 @@
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/sysmem_sysevent.h#L7-L83
 #define SCE_SUSPEND_EVENTS                          0x0000FF00
 #define SCE_SYSTEM_SUSPEND_EVENT_QUERY              0x00000100
+#define SCE_SYSTEM_SUSPEND_EVENT_CANCELLATION       0x00000101
+#define SCE_SYSTEM_SUSPEND_EVENT_START              0x00000102
 
 // We are building a kernel mode prx plugin
 PSP_MODULE_INFO(MODULE_NAME, PSP_MODULE_KERNEL, MAJOR_VER, MINOR_VER);
@@ -96,16 +96,23 @@ int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result
         // the request is allowed through as a failsafe.
         if(consecutive_sleep_blocks < MAX_CONSECUTIVE_SLEEPS) {
             consecutive_sleep_blocks++;
-            DEBUG_PRINT("Blocked sleep query %#010x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
+            DEBUG_PRINT("Blocked suspend query %#010x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
             return SCE_ERROR_BUSY;
         }
         else {
-            DEBUG_PRINT("Max consecutive sleep queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
+            DEBUG_PRINT("Max consecutive suspend queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
 
             // We won't receive the power switch released callback since we'll be asleep, so reset allow_sleep here.
             allow_sleep = true;
             return SCE_ERROR_OK;
         }
+    }
+    else if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_CANCELLATION) {
+        DEBUG_PRINT("Got suspend cancelled event %#010x - %s\n", ev_id, ev_name);
+
+    }
+    else if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_START) {
+        DEBUG_PRINT("Got suspend start event %#010x - %s\n", ev_id, ev_name);
     }
 
     return SCE_ERROR_OK;
