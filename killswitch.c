@@ -1,4 +1,4 @@
-// PSP-KillSwitch v1.0
+// PSP-KillSwitch v1.1
 // .prx plugin that stops the power switch from putting the unit to sleep, unless a button combo is held down.
 //
 // Ryan Crosby 2025
@@ -33,7 +33,7 @@
 
 #define MODULE_NAME "KillSwitch"
 #define MAJOR_VER 1
-#define MINOR_VER 0
+#define MINOR_VER 1
 
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/common/errors.h
 #define SCE_ERROR_OK                                0x0
