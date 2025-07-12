@@ -7,6 +7,12 @@ add_prx_module(${PROJECT_NAME}
     exports.exp
 )
 
+target_compile_definitions(${PROJECT_NAME}
+    PRIVATE
+    # If the debug configuration pass the DEBUG define to the compiler
+    $<$<CONFIG:Debug>:DEBUG>
+)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     pspdebug
     pspdisplay
@@ -20,6 +26,12 @@ project(KillSwitchHold)
 add_prx_module(${PROJECT_NAME}
     killswitch_hold.c
     exports.exp
+)
+
+target_compile_definitions(${PROJECT_NAME}
+    PRIVATE
+    # If the debug configuration pass the DEBUG define to the compiler
+    $<$<CONFIG:Debug>:DEBUG>
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
