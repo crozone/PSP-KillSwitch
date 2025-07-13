@@ -36,7 +36,7 @@
 
 #define MODULE_NAME "KillSwitchHold"
 #define MAJOR_VER 1
-#define MINOR_VER 1
+#define MINOR_VER 2
 
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/common/errors.h
 #define SCE_ERROR_OK                                0x0
