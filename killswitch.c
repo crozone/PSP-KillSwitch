@@ -34,6 +34,8 @@
 #define MODULE_NAME "KillSwitch"
 #define MAJOR_VER 1
 #define MINOR_VER 1
+#define MAJOR_VER_STR "1"
+#define MINOR_VER_STR "1"
 
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/common/errors.h
 #define SCE_ERROR_OK                                0x0
@@ -251,7 +253,7 @@ int module_start(SceSize args, void *argp)
     pspDebugScreenInit();
     #endif
 
-    DEBUG_PRINT("KillSwitch Module Start\n");
+    DEBUG_PRINT(MODULE_NAME " v" MAJOR_VER_STR "." MINOR_VER_STR " Module Start\n");
 
     result = start_callbacks();
     if(result < 0) {
@@ -273,7 +275,7 @@ int module_start(SceSize args, void *argp)
 int module_stop(SceSize args, void *argp)
 {
     int result;
-    DEBUG_PRINT("KillSwitch Module Stop\n");
+    DEBUG_PRINT(MODULE_NAME " v" MAJOR_VER_STR "." MINOR_VER_STR " Module Stop\n");
 
     result = unregister_suspend_handler();
     if(result < 0) {
