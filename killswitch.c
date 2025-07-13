@@ -16,26 +16,25 @@
 
 #include <stdbool.h>
 
+#define str(s) #s // For stringizing defines
+#define xstr(s) str(s)
+
 #ifdef DEBUG
 #define DEBUG_PRINT(...) pspDebugScreenKprintf( __VA_ARGS__ )
 #else
 #define DEBUG_PRINT(...) do{ } while ( 0 )
 #endif
 
-#define ONE_MSEC 1000
-#define ONE_SEC (1000 * ONE_MSEC)
-
 // Allow the switch to work when this button combo is pressed
 // Hold HOME + Power Switch to sleep.
 // See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
 #define BUTTON_COMBO_MASK PSP_CTRL_HOME
 #define MAX_CONSECUTIVE_SLEEPS 10
+#define CALLBACK_SLOT 0
 
 #define MODULE_NAME "KillSwitch"
 #define MAJOR_VER 1
 #define MINOR_VER 1
-#define MAJOR_VER_STR "1"
-#define MINOR_VER_STR "1"
 
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/common/errors.h
 #define SCE_ERROR_OK                                0x0
@@ -183,28 +182,28 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 	return 0;
 }
 
-// Sets up and process callbacks
+// Set up and process callbacks
 int callback_thread(SceSize args, void *argp)
 {
     int cbid;
-    int slot;
+    int reg_callback_ret;
 
     cbid = sceKernelCreateCallback(MODULE_NAME " Power Callback", power_callback_handler, NULL);
     if(cbid < 0) return cbid;
 
-    slot = scePowerRegisterCallback(0, cbid); // -1 for slot autoassignment didn't work, so use slot 0
+    reg_callback_ret = scePowerRegisterCallback(CALLBACK_SLOT, cbid); // -1 for slot autoassignment doesn't appear to work
 
-    if(slot >= 0) {
-        DEBUG_PRINT("Registered power callback in slot %i\n", slot);
+    if(reg_callback_ret >= 0) {
+        DEBUG_PRINT("Registered power callback in slot " xstr(CALLBACK_SLOT) "\n");
 
         // Sleep and processing callbacks until we get woken up
         sceKernelSleepThreadCB();
 
         // Cleanup
-        scePowerUnregisterCallback(0);
+        scePowerUnregisterCallback(CALLBACK_SLOT);
     }
     else {
-        DEBUG_PRINT("Failed to registered power callback: ret %i\n", slot);
+        DEBUG_PRINT("Failed to register power callback: ret %i\n", reg_callback_ret);
     }
 
     // Cleanup
@@ -253,7 +252,7 @@ int module_start(SceSize args, void *argp)
     pspDebugScreenInit();
     #endif
 
-    DEBUG_PRINT(MODULE_NAME " v" MAJOR_VER_STR "." MINOR_VER_STR " Module Start\n");
+    DEBUG_PRINT(MODULE_NAME " v" xstr(MAJOR_VER) "." xstr(MINOR_VER) " Module Start\n");
 
     result = start_callbacks();
     if(result < 0) {
@@ -275,7 +274,7 @@ int module_start(SceSize args, void *argp)
 int module_stop(SceSize args, void *argp)
 {
     int result;
-    DEBUG_PRINT(MODULE_NAME " v" MAJOR_VER_STR "." MINOR_VER_STR " Module Stop\n");
+    DEBUG_PRINT(MODULE_NAME " v" xstr(MAJOR_VER) "." xstr(MINOR_VER) " Module Stop\n");
 
     result = unregister_suspend_handler();
     if(result < 0) {
