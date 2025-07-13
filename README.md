@@ -36,7 +36,7 @@ For example, with ARK-4 CFW, add the following line to `SEPLUGINS/PLUGINS.TXT`:
 
 ### KillSwitchHold
 
-Disables the power switch for 1 second after hold is deactivated.
+Disables the power switch for 500ms after hold is deactivated.
 
 This is designed to prevent accidental sleep mode when disabling hold and overshooting the detent.
 
@@ -50,6 +50,7 @@ For example, with ARK-4 CFW, add the following line to `SEPLUGINS/PLUGINS.TXT`:
 * You will need a custom firmware installed on your PSP. See the [ARK-4 project](github.com/PSP-Archive/ARK-4) for details on how to install it.
 
 * Copy KillSwitch.prx and/or KillSwitchHold.prx into /SEPLUGINS/ on the root of your Memory Stick
+
 * Edit `SEPLUGINS/PLUGINS.TXT`
   * For KillSwitch and KillSwitchHold, add the lines
     ```
@@ -89,6 +90,3 @@ make
 
 As always, the software is provided as-is without warranties of any kind, or claims of fitness for a particular purpose.
 I take no responsiblity for any damage caused to your hardware. Be safe and always check your work.
-
-
-
