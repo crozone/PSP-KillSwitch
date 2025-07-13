@@ -30,7 +30,7 @@
 // See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
 #define BUTTON_COMBO_MASK PSP_CTRL_HOME
 #define MAX_CONSECUTIVE_SLEEPS 10
-#define CALLBACK_SLOT 0
+#define CALLBACK_SLOT 14
 
 #define MODULE_NAME "KillSwitch"
 #define MAJOR_VER 1
