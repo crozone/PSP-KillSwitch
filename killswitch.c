@@ -60,6 +60,9 @@ PSP_HEAP_SIZE_KB(0);
 // This will make us be called from the module loader thread directly, instead of a secondary kernel thread.
 PSP_NO_CREATE_MAIN_THREAD();
 
+// We don't need any of the newlib features since we're not calling into stdio or stdlib etc
+PSP_DISABLE_NEWLIB();
+
 static int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result);
 static int power_callback_handler(int unknown, int pwrflags, void *common);
 
