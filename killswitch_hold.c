@@ -36,7 +36,7 @@
 
 #define MODULE_NAME "KillSwitchHold"
 #define MAJOR_VER 1
-#define MINOR_VER 2
+#define MINOR_VER 3
 
 #define MODULE_OK       0
 #define MODULE_ERROR    1
