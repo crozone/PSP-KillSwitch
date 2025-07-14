@@ -7,10 +7,9 @@ add_prx_module(${PROJECT_NAME}
     exports.exp
 )
 
-target_compile_definitions(${PROJECT_NAME}
-    PRIVATE
+target_compile_definitions(
     # If the debug configuration pass the DEBUG define to the compiler
-    $<$<CONFIG:Debug>:DEBUG>
+    ${PROJECT_NAME} PRIVATE $<$<CONFIG:Debug>:DEBUG>
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -28,10 +27,9 @@ add_prx_module(${PROJECT_NAME}
     exports.exp
 )
 
-target_compile_definitions(${PROJECT_NAME}
-    PRIVATE
+target_compile_definitions(
     # If the debug configuration pass the DEBUG define to the compiler
-    $<$<CONFIG:Debug>:DEBUG>
+    ${PROJECT_NAME} PRIVATE $<$<CONFIG:Debug>:DEBUG>
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
