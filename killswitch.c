@@ -35,6 +35,9 @@
 #define MAJOR_VER 1
 #define MINOR_VER 2
 
+#define MODULE_OK       0
+#define MODULE_ERROR    1
+
 // https://github.com/uofw/uofw/blob/7ca6ba13966a38667fa7c5c30a428ccd248186cf/include/common/errors.h
 #define SCE_ERROR_OK                                0x0
 #define SCE_ERROR_BUSY                              0x80000021
@@ -47,7 +50,9 @@
 
 // We are building a kernel mode prx plugin
 PSP_MODULE_INFO(MODULE_NAME, PSP_MODULE_KERNEL, MAJOR_VER, MINOR_VER);
-PSP_HEAP_SIZE_KB(-1);
+
+// We don't allocate any heap memory, so set this to 0.
+PSP_HEAP_SIZE_KB(0);
 //PSP_MAIN_THREAD_ATTR(0);
 //PSP_MAIN_THREAD_NAME(MODULE_NAME);
 
@@ -56,6 +61,7 @@ PSP_HEAP_SIZE_KB(-1);
 PSP_NO_CREATE_MAIN_THREAD();
 
 static int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result);
+static int power_callback_handler(int unknown, int pwrflags, void *common);
 
 bool allow_sleep = true;
 int consecutive_sleep_blocks = 0;
@@ -271,7 +277,7 @@ int start_callbacks(void)
 
 int stop_callbacks(void)
 {
-    int result;
+    int result = 0;
     int thid = callback_thid;
     if(thid >= 0) {
         // Unblock sceKernelSleepThreadCB() and have thread begin cleanup
@@ -281,24 +287,35 @@ int stop_callbacks(void)
         }
 
         // Wait for the callback thread to clean up and exit
+        DEBUG_PRINT("Waiting for callback thread exit ...\n");
         result = sceKernelWaitThreadEnd(thid, NULL);
         if(result < 0) {
+            // Thread did not stop, force terminate and delete it
             DEBUG_PRINT("Failed to wait for callback thread exit: ret 0x%08x\n", result);
-        }
-
-        // Delete thread
-        result = sceKernelDeleteThread(thid);
-        if(result >= 0) {
-            callback_thid = -1;
+            DEBUG_PRINT("Terminating and deleting thread\n", result);
+            result = sceKernelTerminateDeleteThread(thid);
+            if(result >= 0) {
+                callback_thid = -1;
+            }
+            else {
+                DEBUG_PRINT("Failed to terminate delete callback thread: ret 0x%08x\n", result);
+            }
         }
         else {
-            DEBUG_PRINT("Failed to delete callback thread: ret 0x%08x\n", result);
+            DEBUG_PRINT("Deleting callback thread ...\n");
+            // Thead stopped cleanly, delete it
+            result = sceKernelDeleteThread(thid);
+            if(result >= 0) {
+                DEBUG_PRINT("Callback cleanup complete.\n");
+                callback_thid = -1;
+            }
+            else {
+                DEBUG_PRINT("Failed to delete callback thread: ret 0x%08x\n", result);
+            }
         }
-
-        return result;
     }
 
-    return 0;
+    return result;
 }
 
 // Called during module init
@@ -314,17 +331,17 @@ int module_start(SceSize args, void *argp)
 
     result = start_callbacks();
     if(result < 0) {
-        return SCE_KERNEL_ERROR_ERROR ;
+        return MODULE_ERROR;
     }
 
     result = register_suspend_handler();
     if(result < 0) {
-        return SCE_KERNEL_ERROR_ERROR;
+        return MODULE_ERROR;
     }
 
     DEBUG_PRINT("Started.\n");
 
-    return SCE_KERNEL_ERROR_OK;
+    return MODULE_OK;
 }
 
 // Called during module deinit
@@ -336,15 +353,15 @@ int module_stop(SceSize args, void *argp)
 
     result = unregister_suspend_handler();
     if(result < 0) {
-        return SCE_KERNEL_ERROR_ERROR;
+        return MODULE_ERROR;
     }
 
     result = stop_callbacks();
     if(result < 0) {
-        return SCE_KERNEL_ERROR_ERROR;
+        return MODULE_ERROR;
     }
 
     DEBUG_PRINT(MODULE_NAME " v" xstr(MAJOR_VER) "." xstr(MINOR_VER) " Module Stop\n");
 
-    return SCE_KERNEL_ERROR_OK;
+    return MODULE_OK;
 }
