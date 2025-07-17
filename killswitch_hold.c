@@ -140,16 +140,17 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
     if(pwrflags & PSP_POWER_CB_HOLD_SWITCH) {
         if(!hold_active) {
             DEBUG_PRINT("Hold activated.\n");
-            hold_release_timestamp = 0;
             hold_active = true;
+            consecutive_sleep_blocks = 0;
+            hold_release_timestamp = 0;
         }
     }
     else {
         if(hold_active) {
             // User just switched off hold.
             DEBUG_PRINT("Hold deactivated.\n");
-            hold_release_timestamp = current_timestamp;
             hold_active = false;
+            hold_release_timestamp = current_timestamp;
         }
     }
 
@@ -161,7 +162,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the hold switch was recently pressed
-        int hold_time_ago = current_timestamp - hold_release_timestamp;
+        clock_t hold_time_ago = current_timestamp - hold_release_timestamp;
         if((hold_release_timestamp != 0) && (hold_time_ago < DISABLE_DURATION)) {
             DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_time_ago / 1000));
             allow_sleep = false;
@@ -169,6 +170,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         else {
             DEBUG_PRINT("Hold not recently pressed, allowing sleep.\n");
             allow_sleep = true;
+            consecutive_sleep_blocks = 0;
         }
     }
     else {
@@ -183,12 +185,9 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         //
         if(!allow_sleep) {
             DEBUG_PRINT("Power switch released, allowing sleep.\n");
+            allow_sleep = true;
+            consecutive_sleep_blocks = 0;
         }
-        allow_sleep = true;
-    }
-
-    if(allow_sleep) {
-        consecutive_sleep_blocks = 0;
     }
 
     return 0;

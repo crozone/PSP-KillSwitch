@@ -98,22 +98,24 @@ int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result
 
     // Trap SCE_SYSTEM_SUSPEND_EVENT_QUERY
     // Basically the ScePowerMain thread is asking us "is it okay to sleep?"
-    if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY && !allow_sleep) {
-        // There are edgecases where we can still get stuck in an infinite sleep request loop,
-        // eg if the user triggers a standby while holding the power switch up.
-        // Limit the maximum number of attempts that can be made during a single sleep disallow duration before
-        // the request is allowed through as a failsafe.
-        if(consecutive_sleep_blocks < MAX_CONSECUTIVE_SLEEPS) {
-            consecutive_sleep_blocks++;
-            DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
-            return SCE_ERROR_BUSY;
-        }
-        else {
-            DEBUG_PRINT("Max consecutive suspend queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
+    if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY) {
+        if(!allow_sleep) {
+            // There are edgecases where we can still get stuck in an infinite sleep request loop,
+            // eg if the user triggers a standby while holding the power switch up.
+            // Limit the maximum number of attempts that can be made during a single sleep disallow duration before
+            // the request is allowed through as a failsafe.
+            if(consecutive_sleep_blocks < MAX_CONSECUTIVE_SLEEPS) {
+                consecutive_sleep_blocks++;
+                DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
+                return SCE_ERROR_BUSY;
+            }
+            else {
+                DEBUG_PRINT("Max consecutive suspend queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
 
-            // We won't receive the power switch released callback since we'll be asleep, so reset allow_sleep here.
-            allow_sleep = true;
-            return SCE_ERROR_OK;
+                // We won't receive the power switch released callback since we'll be asleep, so reset allow_sleep here.
+                allow_sleep = true;
+                return SCE_ERROR_OK;
+            }
         }
     }
     else if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_CANCELLATION) {
@@ -144,6 +146,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
             if((pad_state.Buttons & BUTTON_COMBO_MASK) == BUTTON_COMBO_MASK) {
                 DEBUG_PRINT("Override key pressed, allowing sleep\n");
                 allow_sleep = true;
+                consecutive_sleep_blocks = 0;
             }
             else {
                 DEBUG_PRINT("Disallowing sleep\n");
@@ -154,6 +157,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
             // There was an error reading button state. Allow sleep in this case.
             DEBUG_PRINT("Failed to read button state! Allowing sleep\n");
             allow_sleep = true;
+            consecutive_sleep_blocks = 0;
         }
     }
     else {
@@ -168,13 +172,9 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         //
         if(!allow_sleep) {
             DEBUG_PRINT("Allowing sleep\n");
+            allow_sleep = true;
+            consecutive_sleep_blocks = 0;
         }
-
-        allow_sleep = true;
-    }
-
-    if(allow_sleep) {
-        consecutive_sleep_blocks = 0;
     }
 
     return 0;
