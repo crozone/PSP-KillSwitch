@@ -48,9 +48,7 @@ For example, with ARK-4 CFW, add the following line to `SEPLUGINS/PLUGINS.TXT`:
 ## Installation
 
 * You will need a custom firmware installed on your PSP. See the [ARK-4 project](github.com/PSP-Archive/ARK-4) for details on how to install it.
-
 * Copy KillSwitch.prx and/or KillSwitchHold.prx into /SEPLUGINS/ on the root of your Memory Stick
-
 * Edit `SEPLUGINS/PLUGINS.TXT`
   * For KillSwitch and KillSwitchHold, add the lines
     ```
