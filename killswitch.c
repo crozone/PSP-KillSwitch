@@ -32,6 +32,8 @@
 
 #define ONE_MSEC (1000)
 
+#define LED_BLINK_PERIOD (60 * ONE_MSEC)
+
 // Allow the switch to work when this button combo is pressed
 // Hold HOME + Power Switch to sleep.
 // See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
@@ -90,17 +92,23 @@ static int unregister_sysevent_handler(void);
 // All callbacks are run from the main thread, so no synchronisation is required when accessing globals
 // between power_callback_handler and timer_callback_handler.
 //
-// g_sleep_inhibits_count is atomically set by power_callback_handler.
-// It is atomically tested and decrememnted by sys_event_handler using atomic_test_and_decrement().
+// g_sleep_inhibits_count is shared between power_callback_handler and sys_event_handler.
+// It is atomically set by power_callback_handler.
+// sys_event_handler tests and decrements g_sleep_inhibits_count, however sys_event_handler
+// is called with interrupts completely disabled so the entire operation is atomic.
 //
 // g_led_timer_active is shared between power_callback_handler and timer_callback_handler.
+// Since this is always accessed by callbacks from the single main thread, it is not declared volatile.
+//
 // g_led_is_on is only used within timer_callback_handler.
+// g_timerCallbackId is only used within main_thread and timer_callback_handler (which is called from main_thread)
+// g_mainThreadId is only used by module_start and module_stop.
 
-int g_sleep_inhibits_count = 0;
+unsigned int g_sleep_inhibits_count = 0;
 bool g_led_timer_active = false;
 bool g_led_is_on = true;
-int g_mainThreadId = -1;
 int g_timerCallbackId = -1;
+int g_mainThreadId = -1;
 
 // Our PspSysEventHandler to receive the power switch event
 PspSysEventHandler g_sys_event = {
@@ -124,29 +132,15 @@ PspSysEventHandler g_sys_event = {
     }
 };
 
-// Tests a value for zero, and if not zero, decrements the value.
-// Returns a copy of the initial value.
-static __inline__
-unsigned int atomic_test_and_decrement(volatile unsigned int *value_ptr) {
-    unsigned int value;
-    volatile unsigned int temp;
-
-    do {
-        asm volatile ("ll %0, 0(%1)" : "=r" (temp) : "r" (value_ptr));
-        value = temp;
-        if(!temp) return value;
-        --temp;
-        asm volatile ("sc %0, 0(%1)" : "+r" (temp) : "r" (value_ptr));
-    } while(!temp); // If sc failed because the memory was modified elsewhere, sc will set temp to zero, and we should try again. 
-
-    return value;
-}
-
-
 // int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
 static
 int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 {
+    // This sysevent handler is called in kernel mode with interrupts completely disabled.
+    // It will not be pre-empted or interrupted.
+    // It can therefore assume exclusive control over global variables (g_sleep_inhibits_count)
+    // without using any additional synchronisation mechanisms.
+
     //DEBUG_PRINT("Got SysEvent 0x%08x - %s\n", ev_id, ev_name);
 
     // Trap SCE_SYSTEM_SUSPEND_EVENT_QUERY
@@ -160,10 +154,10 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
         // For example, if the user triggers standby from a dock while holding the power switch up.
         // If this occurs, we will only loop until we run out of sleep inhibits count, and then allow
         // the sleep to occur as a failsafe.
-        unsigned int sleep_inhibits_count = atomic_test_and_decrement(&g_sleep_inhibits_count);
-        if(sleep_inhibits_count) {
-                DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i remaining)\n", ev_id, ev_name, sleep_inhibits_count - 1);
-                return SCE_ERROR_BUSY;
+        if(g_sleep_inhibits_count) {
+            --g_sleep_inhibits_count;
+            DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i remaining)\n", ev_id, ev_name, g_sleep_inhibits_count);
+            return SCE_ERROR_BUSY;
         }
         else {
             DEBUG_PRINT("Accepted suspend query 0x%08x - %s\n", ev_id, ev_name);
@@ -204,6 +198,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
                 g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
 
                 // Start the LED blink timer
+                // The vtimer id is stored at the common pointer location
                 int* vtid_ptr = (int*)common;
                 int vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
                 if(vtid >= 0) {
@@ -286,15 +281,11 @@ int timer_callback_handler(int unknown, int vtimer_id, void *common)
 // typedef unsigned int (*SceKernelVTimerHandlerWide)(SceUID vtid, unsigned long long *schedule, unsigned long long *actual, void *common);
 static
 SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *common) {
-    //DEBUG_PRINT("LED timer callback schedule: %" PRId64 " actual: %" PRId64 "\n", schedule, actual);
-
-    // Don't do any actual work in this timer handler.
-    // This handler isn't running in a proper kernel thread, so calls to many kernel functions
-    // (including sceSysconCtrlLED()) will fail if called from here.
-    // Instead, notify a callback, which is run on the callback thread we have set up.
+    // This handler is run in user mode, so don't call any kernel mode functions from here directly.
+    // Instead, notify a callback, which is run on the kernel callback handling thread we have set up.
 
     // We don't know what *common actually is yet (it's definitely not the pointer we provided to the hander registration function).
-    // So, for now, pass the callback id into this hander using a global variable.
+    // So, for now, pass the callback id to run into this hander using a global variable.
     int cbid = g_timerCallbackId;
     //int* cbid_ptr = (int*)common;
     //int cbid = cbid_ptr != NULL ? *cbid_ptr : -1;
@@ -308,7 +299,7 @@ SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void
     }
 
     // Return time to next invocation
-    return 50 * ONE_MSEC;
+    return LED_BLINK_PERIOD;
 }
 
 // The main thread.
