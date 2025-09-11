@@ -1,4 +1,4 @@
-// PSP-KillSwitchHold v1.1
+// PSP-KillSwitchHold v1.3
 // .prx plugin that stops the power switch from putting the unit to sleep immediately after hold is deactivated.
 // This prevents the issue of accidentally sleeping the PSP when deactivating hold and overshooting the detent.
 //
@@ -10,13 +10,18 @@
 #endif
 
 #include <pspsdk.h>
-#include <psputils.h>
 #include <psppower.h>
 #include <pspsysevent.h>
 #include <pspctrl.h>
 #include <pspkerror.h>
+#include <psptypes.h>
+#include <pspkerneltypes.h>
+#include <pspthreadman.h>
+#include <pspsyscon.h>
+#include <psputils.h> // time_t
 
 #include <stdbool.h>
+#include <inttypes.h>
 
 #define str(s) #s // For stringizing defines
 #define xstr(s) str(s)
@@ -32,7 +37,7 @@
 // Disable sleep for 0.5 seconds after hold is deactivated
 #define DISABLE_DURATION_MS 500
 #define DISABLE_DURATION (DISABLE_DURATION_MS * ONE_MSEC)
-#define MAX_CONSECUTIVE_SLEEPS 10
+#define MAX_CONSECUTIVE_SLEEP_ATTEMPTS 10
 
 #define MODULE_NAME "KillSwitchHold"
 #define MAJOR_VER 1
@@ -66,21 +71,28 @@ PSP_NO_CREATE_MAIN_THREAD();
 // We don't need any of the newlib features since we're not calling into stdio or stdlib etc
 PSP_DISABLE_NEWLIB();
 
-static int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result);
+static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
 static int power_callback_handler(int unknown, int pwrflags, void *common);
 
-bool hold_active = false;
-clock_t hold_release_timestamp = 0;
-bool allow_sleep = true;
-int consecutive_sleep_blocks = 0;
-int callback_thid = -1;
+static int main_thread(SceSize args, void *argp);
+static int register_sysevent_handler(void);
+static int unregister_sysevent_handler(void);
+static int start_main_thread(void);
+static int stop_main_thread(void);
+int module_start(SceSize args, void *argp);
+int module_stop(SceSize args, void *argp);
 
-// Our PspSysEventHandler to receive the power switch event
-PspSysEventHandler sys_event = {
+bool g_hold_active = false;
+clock_t g_hold_release_timestamp = 0;
+unsigned int g_sleep_inhibits_count = 0;
+int g_mainThreadId = -1;
+
+// Our PspSysEventHandler to receive power events
+PspSysEventHandler g_sys_event = {
     .size = sizeof(PspSysEventHandler),
-    .name = "sce" MODULE_NAME, // Arbitrary string, doesn't appear to be used for anything
+    .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
     .type_mask = SCE_SUSPEND_EVENTS,
-    .handler = killswitchSysEventHandler,
+    .handler = sys_event_handler,
     .r28 = 0,
     .busy = 0,
     .next = NULL,
@@ -97,33 +109,40 @@ PspSysEventHandler sys_event = {
     }
 };
 
-int killswitchSysEventHandler(int ev_id, char *ev_name, void *param, int *result)
+// int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
+static
+int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 {
+    // This sysevent handler is called in kernel mode with interrupts completely disabled.
+    // It will not be pre-empted or interrupted.
+    // It can therefore assume exclusive control over global variables (g_sleep_inhibits_count)
+    // without using any additional synchronisation mechanisms.
+
     //DEBUG_PRINT("Got SysEvent 0x%08x - %s\n", ev_id, ev_name);
 
     // Trap SCE_SYSTEM_SUSPEND_EVENT_QUERY
-    // Basically the ScePowerMain thread is asking us "is it okay to sleep?"
-    if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY && !allow_sleep) {
-        // There are edgecases where we can still get stuck in an infinite sleep request loop,
-        // eg if the user triggers a standby while holding the power switch up.
-        // Limit the maximum number of attempts that can be made during a single sleep disallow duration before
-        // the request is allowed through as a failsafe.
-        if(consecutive_sleep_blocks < MAX_CONSECUTIVE_SLEEPS) {
-            consecutive_sleep_blocks++;
-            DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i)\n", ev_id, ev_name, consecutive_sleep_blocks);
+    // This is the ScePowerMain thread asking us "is it okay to sleep?"
+    if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY) {
+        // Instead of using a boolean "allow_sleep" variable, we have a limited count of
+        // sleep inhibits we are allowed to use, before we will give up and allow the sleep.
+        //
+        // This is done to avoid crashing the PSP in edgecases that cause infinite sleep request loops,
+        // where the system won't take no for an answer.
+        // For example, if the user triggers standby from a dock while holding the power switch up.
+        // If this occurs, we will only loop until we run out of sleep inhibits count, and then allow
+        // the sleep to occur as a failsafe.
+        if(g_sleep_inhibits_count) {
+            --g_sleep_inhibits_count;
+            DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i remaining)\n", ev_id, ev_name, g_sleep_inhibits_count);
             return SCE_ERROR_BUSY;
         }
         else {
-            DEBUG_PRINT("Max consecutive suspend queries reached (%i), allowing sleep.\n", consecutive_sleep_blocks);
-
-            // We won't receive the power switch released callback since we'll be asleep, so reset allow_sleep here.
-            allow_sleep = true;
+            DEBUG_PRINT("Accepted suspend query 0x%08x - %s\n", ev_id, ev_name);
             return SCE_ERROR_OK;
         }
     }
     else if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_CANCELLATION) {
         DEBUG_PRINT("Got suspend cancelled event 0x%08x - %s\n", ev_id, ev_name);
-
     }
     else if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_START) {
         DEBUG_PRINT("Got suspend start event 0x%08x - %s\n", ev_id, ev_name);
@@ -138,20 +157,22 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
     clock_t current_timestamp = sceKernelLibcClock();
 
     if(pwrflags & PSP_POWER_CB_HOLD_SWITCH) {
-        if(!hold_active) {
+        if(!g_hold_active) {
+            // User just switched hold ON.
             DEBUG_PRINT("Hold activated.\n");
-            hold_active = true;
-            consecutive_sleep_blocks = 0;
-            hold_release_timestamp = 0;
         }
+
+        g_hold_active = true;
+        g_hold_release_timestamp = 0;
     }
     else {
-        if(hold_active) {
-            // User just switched off hold.
+        if(g_hold_active) {
+            // User just switched hold OFF.
             DEBUG_PRINT("Hold deactivated.\n");
-            hold_active = false;
-            hold_release_timestamp = current_timestamp;
+            g_hold_release_timestamp = current_timestamp;
         }
+
+        g_hold_active = false;
     }
 
     if (pwrflags & PSP_POWER_CB_POWER_SWITCH) {
@@ -162,15 +183,14 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the hold switch was recently pressed
-        clock_t hold_time_ago = current_timestamp - hold_release_timestamp;
-        if((hold_release_timestamp != 0) && (hold_time_ago < DISABLE_DURATION)) {
-            DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_time_ago / 1000));
-            allow_sleep = false;
+        clock_t hold_released_duration = current_timestamp - g_hold_release_timestamp;
+        if((g_hold_release_timestamp != 0) && (hold_released_duration < DISABLE_DURATION)) {
+            DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_released_duration / 1000));
+            g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
         }
         else {
             DEBUG_PRINT("Hold not recently pressed, allowing sleep.\n");
-            allow_sleep = true;
-            consecutive_sleep_blocks = 0;
+            g_sleep_inhibits_count = 0;
         }
     }
     else {
@@ -183,75 +203,90 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         // until we eventually return SCE_ERROR_OK, or we spin until the system watchdog takes us down.
         // Specifically, it appears that anything that calls scePowerRequestStandby() will re-fire the event forever.
         //
-        if(!allow_sleep) {
+        if(g_sleep_inhibits_count) {
             DEBUG_PRINT("Power switch released, allowing sleep.\n");
-            allow_sleep = true;
-            consecutive_sleep_blocks = 0;
         }
+
+        g_sleep_inhibits_count = 0;
     }
 
     return 0;
 }
 
-// Set up and process callbacks
-int callback_thread(SceSize args, void *argp)
+// The main thread.
+// * Sets up callbacks
+// * Sleeps and processes callbacks
+// * Cleans up when awoken.
+static
+int main_thread(SceSize args, void *argp)
 {
-    int cbid;
+    int power_cbid = -1;
     int reg_callback_ret;
     int slot;
 
+    //
+    // Setup
+    //
     DEBUG_PRINT("Creating power callback\n");
-    cbid = sceKernelCreateCallback(MODULE_NAME " Power Callback", power_callback_handler, NULL);
-    if(cbid < 0) {
-        DEBUG_PRINT("Failed to create power callback: ret 0x%08x\n", cbid);
-        return cbid;
-    }
-
-    // -1 for slot autoassignment doesn't appear to work, so search backwards for an available slot manually
-    for(slot = 15; slot >= 0; slot--) {
-        DEBUG_PRINT("Registering power callback in slot %i\n", slot);
-        reg_callback_ret = scePowerRegisterCallback(slot, cbid);
-        if(reg_callback_ret >= 0) {
-            break;
+    power_cbid = sceKernelCreateCallback(MODULE_NAME " Power Callback", power_callback_handler, NULL);
+    if(power_cbid >= 0) {
+        // -1 for slot autoassignment doesn't appear to work, so search backwards for an available slot manually
+        for(slot = 15; slot >= 0; slot--) {
+            DEBUG_PRINT("Registering power callback in slot %i\n", slot);
+            reg_callback_ret = scePowerRegisterCallback(slot, power_cbid);
+            if(reg_callback_ret >= 0) {
+                DEBUG_PRINT("Power callback successfully registered in slot %i\n", slot);
+                break;
+            }
+            else {
+                DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+            }
         }
-        else {
-            DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, reg_callback_ret);
-        }
-    }
 
-    if(reg_callback_ret >= 0 && slot >= 0) {
-        DEBUG_PRINT("Power callback successfully registered in slot %i\n", slot);
-        DEBUG_PRINT("Now processing callbacks\n");
-
-        // Sleep and processing callbacks until we get woken up
-        sceKernelSleepThreadCB();
-
-        // Cleanup
-        reg_callback_ret = scePowerUnregisterCallback(slot);
-        if(reg_callback_ret < 0) {
-            // We can't really do anything about an error here except log it, although we don't expect this to error
-            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+        if(slot < 0) {
+            DEBUG_PRINT("Failed to register power callback in any slot!\n");
         }
     }
     else {
-        DEBUG_PRINT("Failed to register power callback in any slot!\n");
+        DEBUG_PRINT("Failed to create power callback: ret 0x%08x\n", power_cbid);
     }
 
+    register_sysevent_handler();
+
+    //
+    // Sleep and process callbacks until we get woken up
+    //
+    DEBUG_PRINT("Now processing callbacks\n");
+    sceKernelSleepThreadCB();
+
+    //
     // Cleanup
-    DEBUG_PRINT("Deleting power callback\n");
-    int delete_ret = sceKernelDeleteCallback(cbid);
-    if(delete_ret < 0) {
-        // We can't really do anything about an error here except log it, although we don't expect this to error
-        DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", delete_ret);
+    //
+    unregister_sysevent_handler();
+
+    if(slot >= 0) {
+        reg_callback_ret = scePowerUnregisterCallback(slot);
+        if(reg_callback_ret < 0) {
+            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+        }
+    }
+
+    if(power_cbid >= 0) {
+        DEBUG_PRINT("Deleting power callback\n");
+        int delete_power_callback_ret = sceKernelDeleteCallback(power_cbid);
+        if(delete_power_callback_ret < 0) {
+            DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", delete_power_callback_ret);
+        }
     }
 
     return 0;
 }
 
-int register_suspend_handler(void)
+static
+int register_sysevent_handler(void)
 {
     DEBUG_PRINT("Registering sysevent handler\n");
-    int register_sysevent_ret = sceKernelRegisterSysEventHandler(&sys_event);
+    int register_sysevent_ret = sceKernelRegisterSysEventHandler(&g_sys_event);
     if(register_sysevent_ret < 0) {
         DEBUG_PRINT("Failed to register sysevent handler: ret 0x%08x\n", register_sysevent_ret);
     }
@@ -259,10 +294,11 @@ int register_suspend_handler(void)
     return register_sysevent_ret;
 }
 
-int unregister_suspend_handler(void)
+static
+int unregister_sysevent_handler(void)
 {
     DEBUG_PRINT("Unregistering sysevent handler\n");
-    int unregister_sysevent_ret = sceKernelUnregisterSysEventHandler(&sys_event);
+    int unregister_sysevent_ret = sceKernelUnregisterSysEventHandler(&g_sys_event);
     if(unregister_sysevent_ret < 0) {
         DEBUG_PRINT("Failed to unregister sysevent handler: ret 0x%08x\n", unregister_sysevent_ret);
     }
@@ -270,63 +306,64 @@ int unregister_suspend_handler(void)
     return unregister_sysevent_ret;
 }
 
-// Starts callback thread
-int start_callbacks(void)
+static
+int start_main_thread(void)
 {
     int result;
     // name, entry, initPriority, stackSize, PspThreadAttributes, SceKernelThreadOptParam
-    result = sceKernelCreateThread(MODULE_NAME "TaskCallbacks", callback_thread, 0x11, 0x800, 0, 0);
+    result = sceKernelCreateThread(MODULE_NAME "MainThread", main_thread, 0x11, 0x800, 0, 0);
     if (result >= 0) {
-        callback_thid = result;
-        DEBUG_PRINT("Starting callback thread\n");
+        g_mainThreadId = result;
+        DEBUG_PRINT("Starting main thread\n");
         result = sceKernelStartThread(result, 0, 0);
         if(result < 0) {
-            DEBUG_PRINT("Failed to start callback thread: ret 0x%08x\n", result);
+            DEBUG_PRINT("Failed to start main thread: ret 0x%08x\n", result);
         }
     }
     else {
-        DEBUG_PRINT("Failed to create callback thread: ret 0x%08x\n", result);
+        DEBUG_PRINT("Failed to create main thread: ret 0x%08x\n", result);
     }
 
     return result;
 }
 
-int stop_callbacks(void)
+static
+int stop_main_thread(void)
 {
     int result = 0;
-    int thid = callback_thid;
+    int thid = g_mainThreadId;
     if(thid >= 0) {
         // Unblock sceKernelSleepThreadCB() and have thread begin cleanup
         result = sceKernelWakeupThread(thid);
         if(result < 0) {
-            DEBUG_PRINT("Failed to wakeup callback thread: ret 0x%08x\n", result);
+            DEBUG_PRINT("Failed to wakeup main thread: ret 0x%08x\n", result);
         }
 
-        // Wait for the callback thread to clean up and exit
-        DEBUG_PRINT("Waiting for callback thread exit ...\n");
+        // Wait for the main thread to clean up and exit
+        DEBUG_PRINT("Waiting for main thread exit ...\n");
         result = sceKernelWaitThreadEnd(thid, NULL);
         if(result < 0) {
             // Thread did not stop, force terminate and delete it
-            DEBUG_PRINT("Failed to wait for callback thread exit: ret 0x%08x\n", result);
-            DEBUG_PRINT("Terminating and deleting thread\n", result);
+            DEBUG_PRINT("Failed to wait for main thread exit: ret 0x%08x\n", result);
+            DEBUG_PRINT("Terminating and deleting main thread\n", result);
             result = sceKernelTerminateDeleteThread(thid);
             if(result >= 0) {
-                callback_thid = -1;
+                g_mainThreadId = -1;
             }
             else {
                 DEBUG_PRINT("Failed to terminate delete callback thread: ret 0x%08x\n", result);
             }
         }
         else {
-            DEBUG_PRINT("Deleting callback thread ...\n");
+            DEBUG_PRINT("Deleting main thread\n");
             // Thead stopped cleanly, delete it
             result = sceKernelDeleteThread(thid);
             if(result >= 0) {
-                DEBUG_PRINT("Callback cleanup complete.\n");
-                callback_thid = -1;
+                DEBUG_PRINT("Main thread cleanup complete.\n");
+                g_mainThreadId = -1;
             }
             else {
-                DEBUG_PRINT("Failed to delete callback thread: ret 0x%08x\n", result);
+                DEBUG_PRINT("Failed to delete main thread: ret 0x%08x\n", result);
             }
         }
     }
@@ -345,12 +382,7 @@ int module_start(SceSize args, void *argp)
 
     DEBUG_PRINT(MODULE_NAME " v" xstr(MAJOR_VER) "." xstr(MINOR_VER) " Module Start\n");
 
-    result = start_callbacks();
-    if(result < 0) {
-        return MODULE_ERROR;
-    }
-
-    result = register_suspend_handler();
+    result = start_main_thread();
     if(result < 0) {
         return MODULE_ERROR;
     }
@@ -367,12 +399,7 @@ int module_stop(SceSize args, void *argp)
 
     DEBUG_PRINT("Stopping ...\n");
 
-    result = unregister_suspend_handler();
-    if(result < 0) {
-        return MODULE_ERROR;
-    }
-
-    result = stop_callbacks();
+    result = stop_main_thread();
     if(result < 0) {
         return MODULE_ERROR;
     }
