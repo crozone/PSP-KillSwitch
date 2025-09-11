@@ -1,5 +1,8 @@
-// PSP-KillSwitch v1.1
-// .prx plugin that stops the power switch from putting the unit to sleep, unless a button combo is held down.
+// PSP-KillSwitch v1.3
+// .prx plugin that stops the power switch from putting the unit to sleep,
+// unless a button combo is held down.
+//
+// The power LED flashes rapidly to alert the user that the sleep is being blocked.
 //
 // Ryan Crosby 2025
 
@@ -79,11 +82,18 @@ PSP_DISABLE_NEWLIB();
 
 static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
 static int power_callback_handler(int unknown, int pwrflags, void *common);
+static int timer_callback_handler(int unknown, int vtimer_id, void *common);
 static SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *common);
+
+static int main_thread(SceSize args, void *argp);
 static int create_led_timer(int* p_callback_id);
 static int delete_led_timer(int vtimer_id);
 static int register_sysevent_handler(void);
 static int unregister_sysevent_handler(void);
+static int start_main_thread(void);
+static int stop_main_thread(void);
+int module_start(SceSize args, void *argp);
+int module_stop(SceSize args, void *argp);
 
 // Globals.
 //
@@ -110,10 +120,10 @@ bool g_led_is_on = true;
 int g_timerCallbackId = -1;
 int g_mainThreadId = -1;
 
-// Our PspSysEventHandler to receive the power switch event
+// Our PspSysEventHandler to receive power events
 PspSysEventHandler g_sys_event = {
     .size = sizeof(PspSysEventHandler),
-    .name = "sce" MODULE_NAME, // Arbitrary string, doesn't appear to be used for anything
+    .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
     .type_mask = SCE_SUSPEND_EVENTS,
     .handler = sys_event_handler,
     .r28 = 0,
@@ -242,7 +252,9 @@ static
 int timer_callback_handler(int unknown, int vtimer_id, void *common)
 {
     int led_ret;
-    if(g_led_timer_active && g_led_is_on) {
+    bool keep_timer_active = g_led_timer_active;
+
+    if(keep_timer_active && g_led_is_on) {
         // Turn the LED off
         led_ret = sceSysconCtrlLED(
             POWER_LED,
@@ -267,7 +279,7 @@ int timer_callback_handler(int unknown, int vtimer_id, void *common)
             DEBUG_PRINT("LED ON error: %d\n", led_ret);
         }
 
-        if(!g_led_timer_active) {
+        if(!keep_timer_active) {
             if(vtimer_id >= 0) {
                 DEBUG_PRINT("Stop LED timer\n");
                 sceKernelStopVTimer(vtimer_id);
