@@ -81,13 +81,13 @@ PSP_NO_CREATE_MAIN_THREAD();
 PSP_DISABLE_NEWLIB();
 
 static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
-static int power_callback_handler(int unknown, int pwrflags, void *common);
-static int timer_callback_handler(int unknown, int vtimer_id, void *common);
-static SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *common);
+static int power_callback_handler(int unknown, int pwrflags, void *p_common);
+static int timer_callback_handler(int unknown, int vtid, void *p_common);
+static SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *p_common);
 
 static int main_thread(SceSize args, void *argp);
-static int create_led_timer(int* p_callback_id);
-static int delete_led_timer(int vtimer_id);
+static SceUID create_led_timer(SceUID* p_callback_id);
+static int delete_led_timer(SceUID vtid);
 static int start_main_thread(void);
 static int stop_main_thread(void);
 int module_start(SceSize args, void *argp);
@@ -110,8 +110,8 @@ int module_stop(SceSize args, void *argp);
 
 unsigned int g_sleep_inhibits_count = 0;
 bool g_led_timer_active = false;
-int g_timerCallbackId = -1;
-int g_mainThreadId = -1;
+SceUID g_timerCallbackId = -1;
+SceUID g_mainThreadId = -1;
 
 // int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
 static
@@ -156,8 +156,9 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 }
 
 // Power Callback handler
+// int (*SceKernelCallbackFunction)(int arg1, int arg2, void *arg)
 static
-int power_callback_handler(int unknown, int pwrflags, void *common)
+int power_callback_handler(int unknown, int pwrflags, void *p_common)
 {
     if (pwrflags & PSP_POWER_CB_POWER_SWITCH) {
         // This is called immediately as the switch is pressed.
@@ -180,8 +181,8 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 
                 // Start the LED blink timer
                 // The vtimer id is stored at the common pointer location
-                int* vtid_ptr = (int*)common;
-                int vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
+                SceUID* vtid_ptr = (SceUID*)p_common;
+                SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
                 if(vtid >= 0) {
                     DEBUG_PRINT("Start LED timer\n");
                     g_led_timer_active = true;
@@ -219,8 +220,9 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 }
 
 // Timer Callback handler
+// int (*SceKernelCallbackFunction)(int arg1, int arg2, void *arg)
 static
-int timer_callback_handler(int unknown, int vtimer_id, void *common)
+int timer_callback_handler(int unknown, int vtid, void *p_common)
 {
     static bool led_is_on = true;
 
@@ -242,9 +244,9 @@ int timer_callback_handler(int unknown, int vtimer_id, void *common)
     }
     else {
         if(!timer_active) {
-            if(vtimer_id >= 0) {
+            if(vtid >= 0) {
                 DEBUG_PRINT("Stop LED timer\n");
-                sceKernelStopVTimer(vtimer_id);
+                sceKernelStopVTimer((SceUID)vtid);
             }
         }
 
@@ -264,16 +266,16 @@ int timer_callback_handler(int unknown, int vtimer_id, void *common)
     return 0;
 }
 
-// typedef unsigned int (*SceKernelVTimerHandlerWide)(SceUID vtid, unsigned long long *schedule, unsigned long long *actual, void *common);
+// typedef unsigned int (*SceKernelVTimerHandlerWide)(SceUID vtid, unsigned long long *schedule, unsigned long long *actual, void *p_common);
 static
-SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *common) {
+SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *p_common) {
     // This handler is run in user mode, so don't call any kernel mode functions from here directly.
     // Instead, notify a callback, which is run on the kernel callback handling thread we have set up.
 
-    // We don't know what *common actually is yet (it's definitely not the pointer we provided to the hander registration function).
+    // We don't know what *p_common actually is yet (it's definitely not the pointer we provided to the hander registration function).
     // So, for now, pass the callback id to run into this hander using a global variable.
     int cbid = g_timerCallbackId;
-    //int* cbid_ptr = (int*)common;
+    //int* cbid_ptr = (int*)p_common;
     //int cbid = cbid_ptr != NULL ? *cbid_ptr : -1;
     if(cbid >= 0) {
         int callback_ret = sceKernelNotifyCallback(cbid, vtid);
@@ -295,9 +297,9 @@ SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void
 static
 int main_thread(SceSize args, void *argp)
 {
-    int timer_cbid = -1;
-    int led_vtid = -1;
-    int power_cbid = -1;
+    SceUID timer_cbid = -1;
+    SceUID led_vtid = -1;
+    SceUID power_cbid = -1;
     int slot;
     int result;
 
@@ -415,24 +417,24 @@ int main_thread(SceSize args, void *argp)
 }
 
 static
-int create_led_timer(int* p_callback_id)
+SceUID create_led_timer(SceUID* p_callback_id)
 {
     DEBUG_PRINT("Registering LED timer\n");
-    SceUID vtimer_id = sceKernelCreateVTimer(MODULE_NAME " LED Timer", NULL);
+    SceUID vtid = sceKernelCreateVTimer(MODULE_NAME " LED Timer", NULL);
 
-    if(vtimer_id >= 0) {
+    if(vtid >= 0) {
         int set_vtimer_handle_ret;
 
         // Stop the timer
-        sceKernelStopVTimer(vtimer_id);
+        sceKernelStopVTimer(vtid);
 
         // Reset the timer time to zero
-        sceKernelSetVTimerTimeWide(vtimer_id, sceKernelUSec2SysClockWide(0));
+        sceKernelSetVTimerTimeWide(vtid, sceKernelUSec2SysClockWide(0));
 
         // Register callback on created vtimer.
         // Use Wide version so we get to use SceInt64 for time instead of *SceKernelSysClock
         set_vtimer_handle_ret = sceKernelSetVTimerHandlerWide(
-            vtimer_id,
+            vtid,
             sceKernelUSec2SysClockWide(10 * ONE_MSEC),
             led_vtimer_handler,
             p_callback_id // TODO: Doesn't get passed to handler directly, the ptr changes.
@@ -443,17 +445,17 @@ int create_led_timer(int* p_callback_id)
         }
     }
     else {
-        DEBUG_PRINT("Failed to create LED timer: ret 0x%08x\n", vtimer_id);
+        DEBUG_PRINT("Failed to create LED timer: ret 0x%08x\n", vtid);
     }
 
-    return vtimer_id;
+    return vtid;
 }
 
 static
-int delete_led_timer(int vtimer_id)
+int delete_led_timer(SceUID vtid)
 {
     DEBUG_PRINT("Deleting LED timer\n");
-    int delete_vtimer_ret = sceKernelDeleteVTimer(vtimer_id);
+    int delete_vtimer_ret = sceKernelDeleteVTimer(vtid);
     if(delete_vtimer_ret < 0) {
         DEBUG_PRINT("Failed to delete LED timer handler: ret 0x%08x\n", delete_vtimer_ret);
     }
@@ -465,17 +467,21 @@ static
 int start_main_thread(void)
 {
     int result;
+    SceUID thid;
+
     // name, entry, initPriority, stackSize, PspThreadAttributes, SceKernelThreadOptParam
-    result = sceKernelCreateThread(MODULE_NAME "MainThread", main_thread, 0x11, 0x800, 0, 0);
-    if (result >= 0) {
-        g_mainThreadId = result;
+    thid = sceKernelCreateThread(MODULE_NAME "MainThread", main_thread, 0x11, 0x800, 0, 0);
+    if (thid >= 0) {
         DEBUG_PRINT("Starting main thread\n");
-        result = sceKernelStartThread(result, 0, 0);
+        result = sceKernelStartThread(thid, 0, 0);
         if(result < 0) {
             DEBUG_PRINT("Failed to start main thread: ret 0x%08x\n", result);
         }
+
+        g_mainThreadId = thid;
     }
     else {
+        result = thid;
         DEBUG_PRINT("Failed to create main thread: ret 0x%08x\n", result);
     }
 
@@ -486,7 +492,8 @@ static
 int stop_main_thread(void)
 {
     int result = 0;
-    int thid = g_mainThreadId;
+    SceUID thid = g_mainThreadId;
+
     if(thid >= 0) {
         // Unblock sceKernelSleepThreadCB() and have thread begin cleanup
         result = sceKernelWakeupThread(thid);

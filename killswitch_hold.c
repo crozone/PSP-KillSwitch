@@ -72,7 +72,7 @@ PSP_NO_CREATE_MAIN_THREAD();
 PSP_DISABLE_NEWLIB();
 
 static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
-static int power_callback_handler(int unknown, int pwrflags, void *common);
+static int power_callback_handler(int unknown, int pwrflags, void *p_common);
 
 static int main_thread(SceSize args, void *argp);
 static int start_main_thread(void);
@@ -92,7 +92,7 @@ int module_stop(SceSize args, void *argp);
 // g_mainThreadId is only used by module_start and module_stop.
 
 unsigned int g_sleep_inhibits_count = 0;
-int g_mainThreadId = -1;
+SceUID g_mainThreadId = -1;
 
 // Our PspSysEventHandler to receive power events
 PspSysEventHandler g_sys_event = {
@@ -159,7 +159,7 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 }
 
 // Power Callback handler
-int power_callback_handler(int unknown, int pwrflags, void *common)
+int power_callback_handler(int unknown, int pwrflags, void *p_common)
 {
     static bool hold_active = false;
     static clock_t hold_release_timestamp = 0;
@@ -230,7 +230,7 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 static
 int main_thread(SceSize args, void *argp)
 {
-    int power_cbid = -1;
+    SceUID power_cbid = -1;
     int slot;
     int result;
 
@@ -326,17 +326,21 @@ static
 int start_main_thread(void)
 {
     int result;
+    SceUID thid;
+
     // name, entry, initPriority, stackSize, PspThreadAttributes, SceKernelThreadOptParam
-    result = sceKernelCreateThread(MODULE_NAME "MainThread", main_thread, 0x11, 0x800, 0, 0);
-    if (result >= 0) {
-        g_mainThreadId = result;
+    thid = sceKernelCreateThread(MODULE_NAME "MainThread", main_thread, 0x11, 0x800, 0, 0);
+    if (thid >= 0) {
         DEBUG_PRINT("Starting main thread\n");
-        result = sceKernelStartThread(result, 0, 0);
+        result = sceKernelStartThread(thid, 0, 0);
         if(result < 0) {
             DEBUG_PRINT("Failed to start main thread: ret 0x%08x\n", result);
         }
+
+        g_mainThreadId = thid;
     }
     else {
+        result = thid;
         DEBUG_PRINT("Failed to create main thread: ret 0x%08x\n", result);
     }
 
@@ -347,7 +351,8 @@ static
 int stop_main_thread(void)
 {
     int result = 0;
-    int thid = g_mainThreadId;
+    SceUID thid = g_mainThreadId;
+
     if(thid >= 0) {
         // Unblock sceKernelSleepThreadCB() and have thread begin cleanup
         result = sceKernelWakeupThread(thid);
