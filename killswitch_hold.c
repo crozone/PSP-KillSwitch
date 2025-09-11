@@ -75,15 +75,22 @@ static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 static int power_callback_handler(int unknown, int pwrflags, void *common);
 
 static int main_thread(SceSize args, void *argp);
-static int register_sysevent_handler(void);
-static int unregister_sysevent_handler(void);
 static int start_main_thread(void);
 static int stop_main_thread(void);
 int module_start(SceSize args, void *argp);
 int module_stop(SceSize args, void *argp);
 
-bool g_hold_active = false;
-clock_t g_hold_release_timestamp = 0;
+// Globals.
+//
+// A note about thread safety:
+//
+// g_sleep_inhibits_count is shared between power_callback_handler and sys_event_handler.
+// It is atomically set by power_callback_handler.
+// sys_event_handler tests and decrements g_sleep_inhibits_count, however sys_event_handler
+// is called with interrupts completely disabled so the entire operation is atomic.
+//
+// g_mainThreadId is only used by module_start and module_stop.
+
 unsigned int g_sleep_inhibits_count = 0;
 int g_mainThreadId = -1;
 
@@ -154,25 +161,28 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 // Power Callback handler
 int power_callback_handler(int unknown, int pwrflags, void *common)
 {
+    static bool hold_active = false;
+    static clock_t hold_release_timestamp = 0;
+
     clock_t current_timestamp = sceKernelLibcClock();
 
     if(pwrflags & PSP_POWER_CB_HOLD_SWITCH) {
-        if(!g_hold_active) {
+        if(!hold_active) {
             // User just switched hold ON.
             DEBUG_PRINT("Hold activated.\n");
         }
 
-        g_hold_active = true;
-        g_hold_release_timestamp = 0;
+        hold_active = true;
+        hold_release_timestamp = 0;
     }
     else {
-        if(g_hold_active) {
+        if(hold_active) {
             // User just switched hold OFF.
             DEBUG_PRINT("Hold deactivated.\n");
-            g_hold_release_timestamp = current_timestamp;
+            hold_release_timestamp = current_timestamp;
         }
 
-        g_hold_active = false;
+        hold_active = false;
     }
 
     if (pwrflags & PSP_POWER_CB_POWER_SWITCH) {
@@ -183,8 +193,8 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
         DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the hold switch was recently pressed
-        clock_t hold_released_duration = current_timestamp - g_hold_release_timestamp;
-        if((g_hold_release_timestamp != 0) && (hold_released_duration < DISABLE_DURATION)) {
+        clock_t hold_released_duration = current_timestamp - hold_release_timestamp;
+        if((hold_release_timestamp != 0) && (hold_released_duration < DISABLE_DURATION)) {
             DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_released_duration / 1000));
             g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
         }
@@ -221,8 +231,30 @@ static
 int main_thread(SceSize args, void *argp)
 {
     int power_cbid = -1;
-    int reg_callback_ret;
     int slot;
+    int result;
+
+    // Our PspSysEventHandler to receive power events
+    PspSysEventHandler sys_event = {
+        .size = sizeof(PspSysEventHandler),
+        .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
+        .type_mask = SCE_SUSPEND_EVENTS,
+        .handler = sys_event_handler,
+        .r28 = 0,
+        .busy = 0,
+        .next = NULL,
+        .reserved = {
+            [0] = 0,
+            [1] = 0,
+            [2] = 0,
+            [3] = 0,
+            [4] = 0,
+            [5] = 0,
+            [6] = 0,
+            [7] = 0,
+            [8] = 0,
+        }
+    };
 
     //
     // Setup
@@ -233,13 +265,13 @@ int main_thread(SceSize args, void *argp)
         // -1 for slot autoassignment doesn't appear to work, so search backwards for an available slot manually
         for(slot = 15; slot >= 0; slot--) {
             DEBUG_PRINT("Registering power callback in slot %i\n", slot);
-            reg_callback_ret = scePowerRegisterCallback(slot, power_cbid);
-            if(reg_callback_ret >= 0) {
+            result = scePowerRegisterCallback(slot, power_cbid);
+            if(result >= 0) {
                 DEBUG_PRINT("Power callback successfully registered in slot %i\n", slot);
                 break;
             }
             else {
-                DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+                DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, result);
             }
         }
 
@@ -251,7 +283,11 @@ int main_thread(SceSize args, void *argp)
         DEBUG_PRINT("Failed to create power callback: ret 0x%08x\n", power_cbid);
     }
 
-    register_sysevent_handler();
+    DEBUG_PRINT("Registering sysevent handler\n");
+    result = sceKernelRegisterSysEventHandler(&sys_event);
+    if(result < 0) {
+        DEBUG_PRINT("Failed to register sysevent handler: ret 0x%08x\n", result);
+    }
 
     //
     // Sleep and process callbacks until we get woken up
@@ -262,48 +298,28 @@ int main_thread(SceSize args, void *argp)
     //
     // Cleanup
     //
-    unregister_sysevent_handler();
+    DEBUG_PRINT("Unregistering sysevent handler\n");
+    result = sceKernelUnregisterSysEventHandler(&sys_event);
+    if(result < 0) {
+        DEBUG_PRINT("Failed to unregister sysevent handler: ret 0x%08x\n", result);
+    }
 
     if(slot >= 0) {
-        reg_callback_ret = scePowerUnregisterCallback(slot);
-        if(reg_callback_ret < 0) {
-            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+        result = scePowerUnregisterCallback(slot);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, result);
         }
     }
 
     if(power_cbid >= 0) {
         DEBUG_PRINT("Deleting power callback\n");
-        int delete_power_callback_ret = sceKernelDeleteCallback(power_cbid);
-        if(delete_power_callback_ret < 0) {
-            DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", delete_power_callback_ret);
+        result = sceKernelDeleteCallback(power_cbid);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", result);
         }
     }
 
     return 0;
-}
-
-static
-int register_sysevent_handler(void)
-{
-    DEBUG_PRINT("Registering sysevent handler\n");
-    int register_sysevent_ret = sceKernelRegisterSysEventHandler(&g_sys_event);
-    if(register_sysevent_ret < 0) {
-        DEBUG_PRINT("Failed to register sysevent handler: ret 0x%08x\n", register_sysevent_ret);
-    }
-
-    return register_sysevent_ret;
-}
-
-static
-int unregister_sysevent_handler(void)
-{
-    DEBUG_PRINT("Unregistering sysevent handler\n");
-    int unregister_sysevent_ret = sceKernelUnregisterSysEventHandler(&g_sys_event);
-    if(unregister_sysevent_ret < 0) {
-        DEBUG_PRINT("Failed to unregister sysevent handler: ret 0x%08x\n", unregister_sysevent_ret);
-    }
-
-    return unregister_sysevent_ret;
 }
 
 static

@@ -88,8 +88,6 @@ static SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actua
 static int main_thread(SceSize args, void *argp);
 static int create_led_timer(int* p_callback_id);
 static int delete_led_timer(int vtimer_id);
-static int register_sysevent_handler(void);
-static int unregister_sysevent_handler(void);
 static int start_main_thread(void);
 static int stop_main_thread(void);
 int module_start(SceSize args, void *argp);
@@ -99,48 +97,21 @@ int module_stop(SceSize args, void *argp);
 //
 // A note about thread safety:
 //
-// All callbacks are run from the main thread, so no synchronisation is required when accessing globals
-// between power_callback_handler and timer_callback_handler.
-//
 // g_sleep_inhibits_count is shared between power_callback_handler and sys_event_handler.
 // It is atomically set by power_callback_handler.
 // sys_event_handler tests and decrements g_sleep_inhibits_count, however sys_event_handler
 // is called with interrupts completely disabled so the entire operation is atomic.
 //
 // g_led_timer_active is shared between power_callback_handler and timer_callback_handler.
-// Since this is always accessed by callbacks from the single main thread, it is not declared volatile.
+// Since this is always accessed by callbacks run from the single main thread, it is not declared volatile.
 //
-// g_led_is_on is only used within timer_callback_handler.
-// g_timerCallbackId is only used within main_thread and timer_callback_handler (which is called from main_thread)
+// g_timerCallbackId is set once within main_thread and used by timer_callback_handler (which is called from main_thread)
 // g_mainThreadId is only used by module_start and module_stop.
 
 unsigned int g_sleep_inhibits_count = 0;
 bool g_led_timer_active = false;
-bool g_led_is_on = true;
 int g_timerCallbackId = -1;
 int g_mainThreadId = -1;
-
-// Our PspSysEventHandler to receive power events
-PspSysEventHandler g_sys_event = {
-    .size = sizeof(PspSysEventHandler),
-    .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
-    .type_mask = SCE_SUSPEND_EVENTS,
-    .handler = sys_event_handler,
-    .r28 = 0,
-    .busy = 0,
-    .next = NULL,
-    .reserved = {
-        [0] = 0,
-        [1] = 0,
-        [2] = 0,
-        [3] = 0,
-        [4] = 0,
-        [5] = 0,
-        [6] = 0,
-        [7] = 0,
-        [8] = 0,
-    }
-};
 
 // int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
 static
@@ -251,39 +222,42 @@ int power_callback_handler(int unknown, int pwrflags, void *common)
 static
 int timer_callback_handler(int unknown, int vtimer_id, void *common)
 {
-    int led_ret;
-    bool keep_timer_active = g_led_timer_active;
+    static bool led_is_on = true;
 
-    if(keep_timer_active && g_led_is_on) {
+    bool timer_active = g_led_timer_active;
+    int led_ret;
+
+    if(timer_active && led_is_on) {
         // Turn the LED off
+        led_is_on = false;
+
         led_ret = sceSysconCtrlLED(
             POWER_LED,
             LED_OFF
         );
-        g_led_is_on = false;
 
         if(led_ret != 0) {
             DEBUG_PRINT("LED OFF error: %d\n", led_ret);
         }
-
     }
     else {
-        // Turn the LED on
-        led_ret = sceSysconCtrlLED(
-            POWER_LED,
-            LED_ON
-        );
-        g_led_is_on = true;
-
-        if(led_ret != 0) {
-            DEBUG_PRINT("LED ON error: %d\n", led_ret);
-        }
-
-        if(!keep_timer_active) {
+        if(!timer_active) {
             if(vtimer_id >= 0) {
                 DEBUG_PRINT("Stop LED timer\n");
                 sceKernelStopVTimer(vtimer_id);
             }
+        }
+
+        // Turn the LED on
+        led_is_on = true;
+
+        led_ret = sceSysconCtrlLED(
+            POWER_LED,
+            LED_ON
+        );
+
+        if(led_ret != 0) {
+            DEBUG_PRINT("LED ON error: %d\n", led_ret);
         }
     }
 
@@ -321,11 +295,33 @@ SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void
 static
 int main_thread(SceSize args, void *argp)
 {
-    int led_vtid = -1;
     int timer_cbid = -1;
+    int led_vtid = -1;
     int power_cbid = -1;
-    int reg_callback_ret;
     int slot;
+    int result;
+
+    // Our PspSysEventHandler to receive power events
+    PspSysEventHandler sys_event = {
+        .size = sizeof(PspSysEventHandler),
+        .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
+        .type_mask = SCE_SUSPEND_EVENTS,
+        .handler = sys_event_handler,
+        .r28 = 0,
+        .busy = 0,
+        .next = NULL,
+        .reserved = {
+            [0] = 0,
+            [1] = 0,
+            [2] = 0,
+            [3] = 0,
+            [4] = 0,
+            [5] = 0,
+            [6] = 0,
+            [7] = 0,
+            [8] = 0,
+        }
+    };
 
     //
     // Setup
@@ -349,13 +345,13 @@ int main_thread(SceSize args, void *argp)
         // -1 for slot autoassignment doesn't appear to work, so search backwards for an available slot manually
         for(slot = 15; slot >= 0; slot--) {
             DEBUG_PRINT("Registering power callback in slot %i\n", slot);
-            reg_callback_ret = scePowerRegisterCallback(slot, power_cbid);
-            if(reg_callback_ret >= 0) {
+            result = scePowerRegisterCallback(slot, power_cbid);
+            if(result >= 0) {
                 DEBUG_PRINT("Power callback successfully registered in slot %i\n", slot);
                 break;
             }
             else {
-                DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+                DEBUG_PRINT("Failed to register power callback in slot %i: ret 0x%08x\n", slot, result);
             }
         }
 
@@ -367,7 +363,11 @@ int main_thread(SceSize args, void *argp)
         DEBUG_PRINT("Failed to create power callback: ret 0x%08x\n", power_cbid);
     }
 
-    register_sysevent_handler();
+    DEBUG_PRINT("Registering sysevent handler\n");
+    result = sceKernelRegisterSysEventHandler(&sys_event);
+    if(result < 0) {
+        DEBUG_PRINT("Failed to register sysevent handler: ret 0x%08x\n", result);
+    }
 
     //
     // Sleep and process callbacks until we get woken up
@@ -378,20 +378,24 @@ int main_thread(SceSize args, void *argp)
     //
     // Cleanup
     //
-    unregister_sysevent_handler();
+    DEBUG_PRINT("Unregistering sysevent handler\n");
+    result = sceKernelUnregisterSysEventHandler(&sys_event);
+    if(result < 0) {
+        DEBUG_PRINT("Failed to unregister sysevent handler: ret 0x%08x\n", result);
+    }
 
     if(slot >= 0) {
-        reg_callback_ret = scePowerUnregisterCallback(slot);
-        if(reg_callback_ret < 0) {
-            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, reg_callback_ret);
+        result = scePowerUnregisterCallback(slot);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to unregister power callback from slot %i: ret 0x%08x\n", slot, result);
         }
     }
 
     if(power_cbid >= 0) {
         DEBUG_PRINT("Deleting power callback\n");
-        int delete_power_callback_ret = sceKernelDeleteCallback(power_cbid);
-        if(delete_power_callback_ret < 0) {
-            DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", delete_power_callback_ret);
+        result = sceKernelDeleteCallback(power_cbid);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to delete power callback: ret 0x%08x\n", result);
         }
     }
 
@@ -401,9 +405,9 @@ int main_thread(SceSize args, void *argp)
 
     if(timer_cbid >= 0) {
         DEBUG_PRINT("Deleting timer callback\n");
-        int delete_timer_callback_ret = sceKernelDeleteCallback(timer_cbid);
-        if(delete_timer_callback_ret < 0) {
-            DEBUG_PRINT("Failed to delete timer callback: ret 0x%08x\n", delete_timer_callback_ret);
+        result = sceKernelDeleteCallback(timer_cbid);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to delete timer callback: ret 0x%08x\n", result);
         }
     }
 
@@ -455,30 +459,6 @@ int delete_led_timer(int vtimer_id)
     }
 
     return delete_vtimer_ret;
-}
-
-static
-int register_sysevent_handler(void)
-{
-    DEBUG_PRINT("Registering sysevent handler\n");
-    int register_sysevent_ret = sceKernelRegisterSysEventHandler(&g_sys_event);
-    if(register_sysevent_ret < 0) {
-        DEBUG_PRINT("Failed to register sysevent handler: ret 0x%08x\n", register_sysevent_ret);
-    }
-
-    return register_sysevent_ret;
-}
-
-static
-int unregister_sysevent_handler(void)
-{
-    DEBUG_PRINT("Unregistering sysevent handler\n");
-    int unregister_sysevent_ret = sceKernelUnregisterSysEventHandler(&g_sys_event);
-    if(unregister_sysevent_ret < 0) {
-        DEBUG_PRINT("Failed to unregister sysevent handler: ret 0x%08x\n", unregister_sysevent_ret);
-    }
-
-    return unregister_sysevent_ret;
 }
 
 static
