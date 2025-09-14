@@ -34,13 +34,9 @@
 #endif
 
 #define ONE_MSEC (1000)
-
 #define LED_BLINK_PERIOD (60 * ONE_MSEC)
 
-// Allow the switch to work when this button combo is pressed
-// Hold HOME + Power Switch to sleep.
-// See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
-#define BUTTON_COMBO_MASK PSP_CTRL_HOME
+// Maximum sleep attempts that can be blocked in a row, before sleep is allowed as a failsafe.
 #define MAX_CONSECUTIVE_SLEEP_ATTEMPTS 10
 
 #define MODULE_NAME "KillSwitch"
@@ -65,6 +61,18 @@
 // The Power LED is really 2.
 #define POWER_LED 2
 
+//
+// KillSwitch (non-hold) specific defines:
+//
+
+// Allow the switch to work when this button combo is pressed.
+// Hold HOME + Power Switch to sleep.
+// See https://pspdev.github.io/pspsdk/group__Ctrl.html#gac080131ea3904c97efb6c31b1c4deb10 for button constants
+#define BUTTON_COMBO_MASK PSP_CTRL_HOME
+
+//
+// PSP SDK
+//
 // We are building a kernel mode prx plugin
 PSP_MODULE_INFO(MODULE_NAME, PSP_MODULE_KERNEL, MAJOR_VER, MINOR_VER);
 
@@ -80,6 +88,9 @@ PSP_NO_CREATE_MAIN_THREAD();
 // We don't need any of the newlib features since we're not calling into stdio or stdlib etc
 PSP_DISABLE_NEWLIB();
 
+//
+// Forward declarations
+//
 static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
 static int power_callback_handler(int unknown, int pwrflags, void *p_common);
 static int timer_callback_handler(int unknown, int vtid, void *p_common);
@@ -93,7 +104,8 @@ static int stop_main_thread(void);
 int module_start(SceSize args, void *argp);
 int module_stop(SceSize args, void *argp);
 
-// Globals.
+//
+// Globals
 //
 // A note about thread safety:
 //
@@ -107,7 +119,7 @@ int module_stop(SceSize args, void *argp);
 //
 // g_timerCallbackId is set once within main_thread and used by timer_callback_handler (which is called from main_thread)
 // g_mainThreadId is only used by module_start and module_stop.
-
+//
 unsigned int g_sleep_inhibits_count = 0;
 bool g_led_timer_active = false;
 SceUID g_timerCallbackId = -1;
@@ -165,7 +177,7 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         // The SysEventHandler is called when the power switch is released, or held down for a second.
         // This gives us a chance to get in before it and decide whether to allow the sleep.
 
-        DEBUG_PRINT("Power switch pressed\n");
+        DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the user is pressing the override key combination
         //

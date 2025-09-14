@@ -2,6 +2,8 @@
 // .prx plugin that stops the power switch from putting the unit to sleep immediately after hold is deactivated.
 // This prevents the issue of accidentally sleeping the PSP when deactivating hold and overshooting the detent.
 //
+// The power LED flashes rapidly to alert the user that the sleep is being blocked.
+//
 // Ryan Crosby 2025
 
 #ifdef DEBUG
@@ -33,10 +35,9 @@
 #endif
 
 #define ONE_MSEC (1000)
+#define LED_BLINK_PERIOD (60 * ONE_MSEC)
 
-// Disable sleep for 0.5 seconds after hold is deactivated
-#define DISABLE_DURATION_MS 500
-#define DISABLE_DURATION (DISABLE_DURATION_MS * ONE_MSEC)
+// Maximum sleep attempts that can be blocked in a row, before sleep is allowed as a failsafe.
 #define MAX_CONSECUTIVE_SLEEP_ATTEMPTS 10
 
 #define MODULE_NAME "KillSwitchHold"
@@ -56,6 +57,22 @@
 #define SCE_SYSTEM_SUSPEND_EVENT_CANCELLATION       0x00000101
 #define SCE_SYSTEM_SUSPEND_EVENT_START              0x00000102
 
+// The SCE_LED_POWER macro from pspsyscon.h is defined as 1, however that appears to be incorrect
+// for the Power LED and is actually for the WLAN LED.
+// The Power LED is really 2.
+#define POWER_LED 2
+
+//
+// KillSwitchHold specific defines:
+//
+
+// Disable sleep for 0.5 seconds after hold is deactivated.
+#define DISABLE_DURATION_MS 500
+#define DISABLE_DURATION (DISABLE_DURATION_MS * ONE_MSEC)
+
+//
+// PSP SDK
+//
 // We are building a kernel mode prx plugin
 PSP_MODULE_INFO(MODULE_NAME, PSP_MODULE_KERNEL, MAJOR_VER, MINOR_VER);
 
@@ -71,16 +88,24 @@ PSP_NO_CREATE_MAIN_THREAD();
 // We don't need any of the newlib features since we're not calling into stdio or stdlib etc
 PSP_DISABLE_NEWLIB();
 
+//
+// Forward declarations
+//
 static int sys_event_handler(int ev_id, char *ev_name, void *param, int *result);
 static int power_callback_handler(int unknown, int pwrflags, void *p_common);
+static int timer_callback_handler(int unknown, int vtid, void *p_common);
+static SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *p_common);
 
 static int main_thread(SceSize args, void *argp);
+static SceUID create_led_timer(SceUID* p_callback_id);
+static int delete_led_timer(SceUID vtid);
 static int start_main_thread(void);
 static int stop_main_thread(void);
 int module_start(SceSize args, void *argp);
 int module_stop(SceSize args, void *argp);
 
-// Globals.
+//
+// Globals
 //
 // A note about thread safety:
 //
@@ -89,32 +114,16 @@ int module_stop(SceSize args, void *argp);
 // sys_event_handler tests and decrements g_sleep_inhibits_count, however sys_event_handler
 // is called with interrupts completely disabled so the entire operation is atomic.
 //
+// g_led_timer_active is shared between power_callback_handler and timer_callback_handler.
+// Since this is always accessed by callbacks run from the single main thread, it is not declared volatile.
+//
+// g_timerCallbackId is set once within main_thread and used by timer_callback_handler (which is called from main_thread)
 // g_mainThreadId is only used by module_start and module_stop.
-
+//
 unsigned int g_sleep_inhibits_count = 0;
+bool g_led_timer_active = false;
+SceUID g_timerCallbackId = -1;
 SceUID g_mainThreadId = -1;
-
-// Our PspSysEventHandler to receive power events
-PspSysEventHandler g_sys_event = {
-    .size = sizeof(PspSysEventHandler),
-    .name = MODULE_NAME " SysEvent Handler", // Arbitrary string, doesn't appear to be used for anything
-    .type_mask = SCE_SUSPEND_EVENTS,
-    .handler = sys_event_handler,
-    .r28 = 0,
-    .busy = 0,
-    .next = NULL,
-    .reserved = {
-        [0] = 0,
-        [1] = 0,
-        [2] = 0,
-        [3] = 0,
-        [4] = 0,
-        [5] = 0,
-        [6] = 0,
-        [7] = 0,
-        [8] = 0,
-    }
-};
 
 // int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
 static
@@ -159,6 +168,8 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 }
 
 // Power Callback handler
+// int (*SceKernelCallbackFunction)(int arg1, int arg2, void *arg)
+static
 int power_callback_handler(int unknown, int pwrflags, void *p_common)
 {
     static bool hold_active = false;
@@ -197,6 +208,16 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         if((hold_release_timestamp != 0) && (hold_released_duration < DISABLE_DURATION)) {
             DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_released_duration / 1000));
             g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
+
+            // Start the LED blink timer
+            // The vtimer id is stored at the common pointer location
+            SceUID* vtid_ptr = (SceUID*)p_common;
+            SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
+            if(vtid >= 0) {
+                DEBUG_PRINT("Start LED timer\n");
+                g_led_timer_active = true;
+                sceKernelStartVTimer(vtid);
+            }
         }
         else {
             DEBUG_PRINT("Hold not recently pressed, allowing sleep.\n");
@@ -204,6 +225,7 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         }
     }
     else {
+        g_led_timer_active = false;
         // If the physical power switch isn't currently pressed, this means any suspend or standby command
         // will be coming from an event that wasn't the user hitting the power switch
         // (eg a PSP HP Remote or Cradle command, or PSPLINK poweroff command).
@@ -213,8 +235,10 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         // until we eventually return SCE_ERROR_OK, or we spin until the system watchdog takes us down.
         // Specifically, it appears that anything that calls scePowerRequestStandby() will re-fire the event forever.
         //
+        // This else statement will also get triggered by PSP_POWER_CB_RESUMING upon the PSP waking back up,
+        // so even if the PSP went to sleep with sleep disabled, it will re-enable here.
         if(g_sleep_inhibits_count) {
-            DEBUG_PRINT("Power switch released, allowing sleep.\n");
+            DEBUG_PRINT("Allowing sleep\n");
         }
 
         g_sleep_inhibits_count = 0;
@@ -223,13 +247,86 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
     return 0;
 }
 
+// Timer Callback handler
+// int (*SceKernelCallbackFunction)(int arg1, int arg2, void *arg)
+static
+int timer_callback_handler(int unknown, int vtid, void *p_common)
+{
+    static bool led_is_on = true;
+
+    bool timer_active = g_led_timer_active;
+    int led_ret;
+
+    if(timer_active && led_is_on) {
+        // Turn the LED off
+        led_is_on = false;
+
+        led_ret = sceSysconCtrlLED(
+            POWER_LED,
+            LED_OFF
+        );
+
+        if(led_ret != 0) {
+            DEBUG_PRINT("LED OFF error: %d\n", led_ret);
+        }
+    }
+    else {
+        if(!timer_active) {
+            if(vtid >= 0) {
+                DEBUG_PRINT("Stop LED timer\n");
+                sceKernelStopVTimer((SceUID)vtid);
+            }
+        }
+
+        // Turn the LED on
+        led_is_on = true;
+
+        led_ret = sceSysconCtrlLED(
+            POWER_LED,
+            LED_ON
+        );
+
+        if(led_ret != 0) {
+            DEBUG_PRINT("LED ON error: %d\n", led_ret);
+        }
+    }
+
+    return 0;
+}
+
+// typedef unsigned int (*SceKernelVTimerHandlerWide)(SceUID vtid, unsigned long long *schedule, unsigned long long *actual, void *p_common);
+static
+SceUInt led_vtimer_handler(SceUID vtid, SceInt64 schedule, SceInt64 actual, void *p_common) {
+    // This handler is run in user mode, so don't call any kernel mode functions from here directly.
+    // Instead, notify a callback, which is run on the kernel callback handling thread we have set up.
+
+    // We don't know what *p_common actually is yet (it's definitely not the pointer we provided to the hander registration function).
+    // So, for now, pass the callback id to run into this hander using a global variable.
+    int cbid = g_timerCallbackId;
+    //int* cbid_ptr = (int*)p_common;
+    //int cbid = cbid_ptr != NULL ? *cbid_ptr : -1;
+    if(cbid >= 0) {
+        int callback_ret = sceKernelNotifyCallback(cbid, vtid);
+
+        if(callback_ret < 0) {
+            DEBUG_PRINT("Callback ret %d\n", callback_ret);
+            return 0;
+        }
+    }
+
+    // Return time to next invocation
+    return LED_BLINK_PERIOD;
+}
+
 // The main thread.
-// * Sets up callbacks
+// * Sets up callbacks and timers
 // * Sleeps and processes callbacks
 // * Cleans up when awoken.
 static
 int main_thread(SceSize args, void *argp)
 {
+    SceUID timer_cbid = -1;
+    SceUID led_vtid = -1;
     SceUID power_cbid = -1;
     int slot;
     int result;
@@ -259,8 +356,21 @@ int main_thread(SceSize args, void *argp)
     //
     // Setup
     //
+    DEBUG_PRINT("Creating timer callback\n");
+    timer_cbid = sceKernelCreateCallback(MODULE_NAME " Timer Callback", timer_callback_handler, NULL);
+    if(timer_cbid >= 0) {
+        // Set a global variable and reference the global variable from the handler.
+        // Hacky, but works for now.
+        g_timerCallbackId = timer_cbid;
+        led_vtid = create_led_timer(&g_timerCallbackId);
+        //led_vtid = create_led_timer(&timer_cbid);
+    }
+    else {
+        DEBUG_PRINT("Failed to create timer callback: ret 0x%08x\n", timer_cbid);
+    }
+
     DEBUG_PRINT("Creating power callback\n");
-    power_cbid = sceKernelCreateCallback(MODULE_NAME " Power Callback", power_callback_handler, NULL);
+    power_cbid = sceKernelCreateCallback(MODULE_NAME " Power Callback", power_callback_handler, &led_vtid);
     if(power_cbid >= 0) {
         // -1 for slot autoassignment doesn't appear to work, so search backwards for an available slot manually
         for(slot = 15; slot >= 0; slot--) {
@@ -319,7 +429,66 @@ int main_thread(SceSize args, void *argp)
         }
     }
 
+    if(led_vtid >= 0) {
+        delete_led_timer(led_vtid);
+    }
+
+    if(timer_cbid >= 0) {
+        DEBUG_PRINT("Deleting timer callback\n");
+        result = sceKernelDeleteCallback(timer_cbid);
+        if(result < 0) {
+            DEBUG_PRINT("Failed to delete timer callback: ret 0x%08x\n", result);
+        }
+    }
+
     return 0;
+}
+
+static
+SceUID create_led_timer(SceUID* p_callback_id)
+{
+    DEBUG_PRINT("Registering LED timer\n");
+    SceUID vtid = sceKernelCreateVTimer(MODULE_NAME " LED Timer", NULL);
+
+    if(vtid >= 0) {
+        int set_vtimer_handle_ret;
+
+        // Stop the timer
+        sceKernelStopVTimer(vtid);
+
+        // Reset the timer time to zero
+        sceKernelSetVTimerTimeWide(vtid, sceKernelUSec2SysClockWide(0));
+
+        // Register callback on created vtimer.
+        // Use Wide version so we get to use SceInt64 for time instead of *SceKernelSysClock
+        set_vtimer_handle_ret = sceKernelSetVTimerHandlerWide(
+            vtid,
+            sceKernelUSec2SysClockWide(10 * ONE_MSEC),
+            led_vtimer_handler,
+            p_callback_id // TODO: Doesn't get passed to handler directly, the ptr changes.
+            );
+
+        if(set_vtimer_handle_ret < 0) {
+            DEBUG_PRINT("Failed to register LED timer handler: ret 0x%08x\n", set_vtimer_handle_ret);
+        }
+    }
+    else {
+        DEBUG_PRINT("Failed to create LED timer: ret 0x%08x\n", vtid);
+    }
+
+    return vtid;
+}
+
+static
+int delete_led_timer(SceUID vtid)
+{
+    DEBUG_PRINT("Deleting LED timer\n");
+    int delete_vtimer_ret = sceKernelDeleteVTimer(vtid);
+    if(delete_vtimer_ret < 0) {
+        DEBUG_PRINT("Failed to delete LED timer handler: ret 0x%08x\n", delete_vtimer_ret);
+    }
+
+    return delete_vtimer_ret;
 }
 
 static
