@@ -20,7 +20,7 @@
 #include <pspkerneltypes.h>
 #include <pspthreadman.h>
 #include <pspsyscon.h>
-#include <psputils.h> // time_t
+#include <psputils.h> // time_t (uint64)
 
 #include <stdbool.h>
 #include <inttypes.h>
@@ -220,7 +220,8 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
             }
         }
         else {
-            DEBUG_PRINT("Hold not recently pressed, allowing sleep.\n");
+            // Hold was never enabled, or is currently enabled (should be impossible).
+            DEBUG_PRINT("Hold never released, enabling sleep.\n");
             g_sleep_inhibits_count = 0;
         }
     }
@@ -238,7 +239,7 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         // This else statement will also get triggered by PSP_POWER_CB_RESUMING upon the PSP waking back up,
         // so even if the PSP went to sleep with sleep disabled, it will re-enable here.
         if(g_sleep_inhibits_count) {
-            DEBUG_PRINT("Allowing sleep\n");
+            DEBUG_PRINT("Power switch released, enabling sleep.\n");
         }
 
         g_sleep_inhibits_count = 0;

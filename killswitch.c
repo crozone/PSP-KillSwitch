@@ -180,15 +180,14 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the user is pressing the override key combination
-        //
         SceCtrlData pad_state;
         if(sceCtrlPeekBufferPositive(&pad_state, 1) >= 0) {
             if((pad_state.Buttons & BUTTON_COMBO_MASK) == BUTTON_COMBO_MASK) {
-                DEBUG_PRINT("Override key pressed, allowing sleep\n");
+                DEBUG_PRINT("Override key pressed, enabling sleep.\n");
                 g_sleep_inhibits_count = 0;
             }
             else {
-                DEBUG_PRINT("Disallowing sleep\n");
+                DEBUG_PRINT("Disabling sleep.\n");
                 g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
 
                 // Start the LED blink timer
@@ -204,7 +203,7 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         }
         else {
             // There was an error reading button state. Allow sleep in this case.
-            DEBUG_PRINT("Failed to read button state! Allowing sleep\n");
+            DEBUG_PRINT("Failed to read button state! Enabling sleep.\n");
             g_sleep_inhibits_count = 0;
         }
     }
@@ -222,7 +221,7 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         // This else statement will also get triggered by PSP_POWER_CB_RESUMING upon the PSP waking back up,
         // so even if the PSP went to sleep with sleep disabled, it will re-enable here.
         if(g_sleep_inhibits_count) {
-            DEBUG_PRINT("Allowing sleep\n");
+            DEBUG_PRINT("Power switch released, enabling sleep.\n");
         }
 
         g_sleep_inhibits_count = 0;
