@@ -204,19 +204,25 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
         DEBUG_PRINT("Power switch pressed.\n");
 
         // Check if the hold switch was recently pressed
-        clock_t hold_released_duration = current_timestamp - hold_release_timestamp;
-        if((hold_release_timestamp != 0) && (hold_released_duration < DISABLE_DURATION)) {
-            DEBUG_PRINT("Hold recently pressed (%ims < " xstr(DISABLE_DURATION_MS) "ms), disallowing sleep.\n", (hold_released_duration / 1000));
-            g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
+        if(!hold_active && hold_release_timestamp != 0) {
+            clock_t hold_released_duration = current_timestamp - hold_release_timestamp;
+            if(hold_released_duration <= DISABLE_DURATION) {
+                DEBUG_PRINT("Hold recently released (%ims <= " xstr(DISABLE_DURATION_MS) "ms), disabling sleep.\n", (hold_released_duration / 1000));
+                g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
 
-            // Start the LED blink timer
-            // The vtimer id is stored at the common pointer location
-            SceUID* vtid_ptr = (SceUID*)p_common;
-            SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
-            if(vtid >= 0) {
-                DEBUG_PRINT("Start LED timer\n");
-                g_led_timer_active = true;
-                sceKernelStartVTimer(vtid);
+                // Start the LED blink timer
+                // The vtimer id is stored at the common pointer location
+                SceUID* vtid_ptr = (SceUID*)p_common;
+                SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
+                if(vtid >= 0) {
+                    DEBUG_PRINT("Start LED timer\n");
+                    g_led_timer_active = true;
+                    sceKernelStartVTimer(vtid);
+                }
+            }
+            else {
+                DEBUG_PRINT("Hold not recently released, (%ims > " xstr(DISABLE_DURATION_MS) "ms) enabling sleep.\n", (hold_released_duration / 1000));
+                g_sleep_inhibits_count = 0;
             }
         }
         else {
