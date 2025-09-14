@@ -66,8 +66,8 @@
 // KillSwitchHold specific defines:
 //
 
-// Disable sleep for 0.5 seconds after hold is deactivated.
-#define DISABLE_DURATION_MS 500
+// Disable sleep for 0.3 seconds after hold is deactivated.
+#define DISABLE_DURATION_MS 300
 #define DISABLE_DURATION (DISABLE_DURATION_MS * ONE_MSEC)
 
 //

@@ -36,7 +36,7 @@ For example, with ARK-4 CFW, add the following line to `SEPLUGINS/PLUGINS.TXT`:
 
 ### KillSwitchHold
 
-Disables the power switch for 500ms after hold is deactivated.
+Disables the power switch for 300ms after hold is deactivated.
 
 This is designed to prevent accidental sleep mode when disabling hold and overshooting the detent.
 
