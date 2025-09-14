@@ -139,14 +139,15 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
     // Trap SCE_SYSTEM_SUSPEND_EVENT_QUERY
     // This is the ScePowerMain thread asking us "is it okay to sleep?"
     if(ev_id == SCE_SYSTEM_SUSPEND_EVENT_QUERY) {
-        // Instead of using a boolean "allow_sleep" variable, we have a limited count of
-        // sleep inhibits we are allowed to use, before we will give up and allow the sleep.
+        // Instead of using a boolean "allow_sleep" variable, we instead have a limited count of
+        // sleep inhibits we are allowed to use, before we will give up and allow the sleep anyway.
         //
-        // This is done to avoid crashing the PSP in edgecases that cause infinite sleep request loops,
-        // where the system won't take no for an answer.
-        // For example, if the user triggers standby from a dock while holding the power switch up.
-        // If this occurs, we will only loop until we run out of sleep inhibits count, and then allow
-        // the sleep to occur as a failsafe.
+        // This is done because many external sources of sleep requests (headphone remote / cradle remote / any software that calls
+        // scePowerRequestSuspend() or scePowerRequestStandby()) trigger sleep requests in an infinite loop until sleep is allowed,
+        // which if blocked indefinitely, crash the PSP and trigger the system watchdog.
+        //
+        // By using a limited count of sleep inhibits, in the worst case we will only ever block up to MAX_CONSECUTIVE_SLEEP_ATTEMPTS,
+        // and external sleep sources will function as expected.
         if(g_sleep_inhibits_count) {
             --g_sleep_inhibits_count;
             DEBUG_PRINT("Blocked suspend query 0x%08x - %s (%i remaining)\n", ev_id, ev_name, g_sleep_inhibits_count);
@@ -172,6 +173,7 @@ int sys_event_handler(int ev_id, char *ev_name, void *param, int *result)
 static
 int power_callback_handler(int unknown, int pwrflags, void *p_common)
 {
+    static bool power_switch_pressed = false;
     static bool hold_active = false;
     static clock_t hold_release_timestamp = 0;
 
@@ -197,58 +199,70 @@ int power_callback_handler(int unknown, int pwrflags, void *p_common)
     }
 
     if (pwrflags & PSP_POWER_CB_POWER_SWITCH) {
-        // This is called immediately as the switch is pressed.
-        // The SysEventHandler is called when the power switch is released, or held down for a second.
-        // This gives us a chance to get in before it and decide whether to allow the sleep.
+        if(!power_switch_pressed) {
+            // This is called immediately as the switch is pressed.
+            // The SysEventHandler is called when the power switch is released, or held down for a second.
+            // This gives us a chance to get in before it and decide whether to allow the sleep.
+            DEBUG_PRINT("Power switch pressed.\n");
 
-        DEBUG_PRINT("Power switch pressed.\n");
+            // Check if the hold switch was recently pressed
+            if(!hold_active && hold_release_timestamp != 0) {
+                clock_t hold_released_duration = current_timestamp - hold_release_timestamp;
+                if(hold_released_duration <= DISABLE_DURATION) {
+                    DEBUG_PRINT("Hold recently released (%ims <= " xstr(DISABLE_DURATION_MS) "ms), disabling sleep.\n", (hold_released_duration / 1000));
+                    g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
 
-        // Check if the hold switch was recently pressed
-        if(!hold_active && hold_release_timestamp != 0) {
-            clock_t hold_released_duration = current_timestamp - hold_release_timestamp;
-            if(hold_released_duration <= DISABLE_DURATION) {
-                DEBUG_PRINT("Hold recently released (%ims <= " xstr(DISABLE_DURATION_MS) "ms), disabling sleep.\n", (hold_released_duration / 1000));
-                g_sleep_inhibits_count = MAX_CONSECUTIVE_SLEEP_ATTEMPTS;
-
-                // Start the LED blink timer
-                // The vtimer id is stored at the common pointer location
-                SceUID* vtid_ptr = (SceUID*)p_common;
-                SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
-                if(vtid >= 0) {
-                    DEBUG_PRINT("Start LED timer\n");
-                    g_led_timer_active = true;
-                    sceKernelStartVTimer(vtid);
+                    // Start the LED blink timer
+                    // The vtimer id is stored at the common pointer location
+                    SceUID* vtid_ptr = (SceUID*)p_common;
+                    SceUID vtid = vtid_ptr != NULL ? *vtid_ptr : -1;
+                    if(vtid >= 0) {
+                        DEBUG_PRINT("Start LED timer\n");
+                        g_led_timer_active = true;
+                        sceKernelStartVTimer(vtid);
+                    }
+                }
+                else {
+                    DEBUG_PRINT("Hold not recently released, (%ims > " xstr(DISABLE_DURATION_MS) "ms) enabling sleep.\n", (hold_released_duration / 1000));
+                    g_sleep_inhibits_count = 0;
                 }
             }
             else {
-                DEBUG_PRINT("Hold not recently released, (%ims > " xstr(DISABLE_DURATION_MS) "ms) enabling sleep.\n", (hold_released_duration / 1000));
+                // Hold was never enabled, or is currently enabled (should be impossible).
+                DEBUG_PRINT("Hold never released, enabling sleep.\n");
                 g_sleep_inhibits_count = 0;
             }
         }
-        else {
-            // Hold was never enabled, or is currently enabled (should be impossible).
-            DEBUG_PRINT("Hold never released, enabling sleep.\n");
-            g_sleep_inhibits_count = 0;
-        }
+
+        power_switch_pressed = true;
     }
     else {
-        g_led_timer_active = false;
-        // If the physical power switch isn't currently pressed, this means any suspend or standby command
-        // will be coming from an event that wasn't the user hitting the power switch
-        // (eg a PSP HP Remote or Cradle command, or PSPLINK poweroff command).
-        //
-        // We need to always allow suspend or standby from these other places, because if we don't,
-        // sleep is re-attempted and SCE_SYSTEM_SUSPEND_EVENT_QUERY is raised in a loop
-        // until we eventually return SCE_ERROR_OK, or we spin until the system watchdog takes us down.
-        // Specifically, it appears that anything that calls scePowerRequestStandby() will re-fire the event forever.
-        //
-        // This else statement will also get triggered by PSP_POWER_CB_RESUMING upon the PSP waking back up,
-        // so even if the PSP went to sleep with sleep disabled, it will re-enable here.
-        if(g_sleep_inhibits_count) {
-            DEBUG_PRINT("Power switch released, enabling sleep.\n");
+        if(power_switch_pressed) {
+            DEBUG_PRINT("Power switch released.\n");
         }
 
-        g_sleep_inhibits_count = 0;
+        power_switch_pressed = false;
+        g_led_timer_active = false;
+
+        // Here, we used to set g_sleep_inhibits_count to zero, to re-enable sleep immediately upon the power switch being released.
+        // This was done because many external sources of sleep requests (headphone remote / cradle remote / any software that called
+        // scePowerRequestSuspend() or scePowerRequestStandby()) would trigger a sleep request in an infinite loop until sleep was allowed,
+        // which if blocked indefinitely, would crash the PSP and trigger the system watchdog.
+        // In order to avoid this at all costs, g_sleep_inhibits_count was set to zero to make sure these sleeps were allowed immediately
+        // and completely unimpeded.
+        //
+        // However, there was yet another edgecase with this strategy.
+        // If an application/game happened to take an scePowerLock() (very common when saving to or loading from the memory card),
+        // and then a sleep was requested during this power lock, the power lock would remember the sleep request
+        // and re-trigger the sleep as soon as the power lock was released.
+        // This would usually occur after the power switch was released when sleep was no longer being blocked by us,
+        // and the PSP would go to sleep undesirably.
+        //
+        // In order to overcome this edgecase, we simply don't zero out g_sleep_inhibits_count here. As long as at least one sleep inhibit is
+        // left over in g_sleep_inhibits_count, it will block the sleep request raised by the power lock being released, and the PSP won't go to sleep.
+        //
+        // If an external sleep source triggers a sleep after this, it will only ever be blocked a maximum of MAX_CONSECUTIVE_SLEEP_ATTEMPTS times,
+        // and the PSP will go to sleep as expected.
     }
 
     return 0;
