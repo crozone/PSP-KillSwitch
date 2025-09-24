@@ -120,10 +120,10 @@ int module_stop(SceSize args, void *argp);
 // g_timerCallbackId is set once within main_thread and used by timer_callback_handler (which is called from main_thread)
 // g_mainThreadId is only used by module_start and module_stop.
 //
-unsigned int g_sleep_inhibits_count = 0;
-bool g_led_timer_active = false;
-SceUID g_timerCallbackId = -1;
-SceUID g_mainThreadId = -1;
+static unsigned int g_sleep_inhibits_count = 0;
+static bool g_led_timer_active = false;
+static SceUID g_timerCallbackId = -1;
+static SceUID g_mainThreadId = -1;
 
 // int(* PspSysEventHandlerFunc) (int ev_id, char *ev_name, void *param, int *result)
 static
